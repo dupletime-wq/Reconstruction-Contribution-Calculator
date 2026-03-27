@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from datetime import date, datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 import math
 import re
 import statistics
@@ -108,6 +108,7 @@ SOURCE_LABELS: dict[str, str] = {
 VALUE_LABELS: dict[str, str] = {
     "pypdf_missing": "`pypdf` \uc124\uce58 \ud544\uc694",
     "unsupported": "\uc9c0\uc6d0\ud558\uc9c0 \uc54a\ub294 \ud30c\uc77c",
+    "parse_error": "\ud30c\uc2f1 \uc2e4\ud328",
 }
 
 COLUMN_LABELS: dict[str, str] = {
@@ -204,6 +205,18 @@ def localized_records_frame(records: list[SourceRecord]) -> pd.DataFrame:
     return frame.rename(columns=COLUMN_LABELS)
 
 
+def read_csv_with_fallbacks(file_bytes: bytes) -> pd.DataFrame:
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
+        try:
+            return pd.read_csv(StringIO(file_bytes.decode(encoding)))
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return pd.read_csv(BytesIO(file_bytes))
+
+
 def parse_korean_money(text: str) -> float | None:
     if not text:
         return None
@@ -283,7 +296,7 @@ def merge_notices(notices: list[ParsedProjectNotice]) -> ParsedProjectNotice | N
 def parse_uploaded_notice(file_name: str, file_bytes: bytes) -> ParsedProjectNotice:
     lower_name = file_name.lower()
     if lower_name.endswith(".csv"):
-        frame = pd.read_csv(BytesIO(file_bytes))
+        frame = read_csv_with_fallbacks(file_bytes)
         extracted_records: list[SourceRecord] = []
         revenue_items: dict[str, float] = {}
         cost_items: dict[str, float] = {}
@@ -356,63 +369,74 @@ def parse_uploaded_notice(file_name: str, file_bytes: bytes) -> ParsedProjectNot
                 extracted_records=[record("parser_status", "pypdf_missing", f"PDF:{file_name}", 0.10, "pypdf \uc124\uce58 \ud544\uc694")],
                 source_name=file_name,
             )
-        reader = PdfReader(BytesIO(file_bytes))
-        text = "\n".join((page.extract_text() or "") for page in reader.pages)
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        revenue_items: dict[str, float] = {}
-        cost_items: dict[str, float] = {}
-        extracted_records: list[SourceRecord] = []
-        proportional_ratio: float | None = None
-        old_asset_formula: str | None = None
-        member_price_table: list[MemberPriceRecord] = []
-        table_pattern = re.compile(
-            r"(?P<label>\d+\s*[A-Za-z\uac00-\ud7a3]+)\s+"
-            r"(?P<exclusive>\d+(?:\.\d+)?)\s+"
-            r"(?P<supply>\d+(?:\.\d+)?)\s+"
-            r"(?P<price>\d[\d,]*(?:\.\d+)?\s*(?:\uc5b5|\ub9cc\uc6d0|\uc6d0)?)"
-        )
-        for line in lines:
-            compact = re.sub(r"\s+", "", line)
-            if "\ube44\ub840\uc728" in compact and proportional_ratio is None:
-                pct_match = PERCENT_PATTERN.search(line)
-                if pct_match:
-                    proportional_ratio = float(pct_match.group(1))
-                    extracted_records.append(record("proportional_ratio", f"{proportional_ratio:.2f}", f"PDF:{file_name}", 0.74))
-            if old_asset_formula is None and ("\uacf5\ub3d9\uc8fc\ud0dd" in compact or "\uacf5\uc2dc\uac00\uaca9" in compact) and ("x" in compact.lower() or "\u00d7" in compact):
-                old_asset_formula = line[:200]
-                extracted_records.append(record("old_asset_formula", old_asset_formula, f"PDF:{file_name}", 0.68))
-            for label, key in KEY_ALIASES.items():
-                if label in compact:
-                    amount = parse_korean_money(line)
-                    if amount is None:
-                        continue
-                    if key in {"member_sale_revenue", "general_sale_revenue", "total_revenue"}:
-                        revenue_items[key] = amount
-                    else:
-                        cost_items[key] = amount
-                    extracted_records.append(record(key, f"{amount:,.0f}", f"PDF:{file_name}", 0.70))
-            for match in table_pattern.finditer(line):
-                price = parse_korean_money(match.group("price"))
-                if price is not None:
-                    member_price_table.append(
-                        MemberPriceRecord(
-                            label=match.group("label"),
-                            exclusive_area_sqm=float(match.group("exclusive")),
-                            supply_area_sqm=float(match.group("supply")),
-                            member_sale_price=price,
+        try:
+            reader = PdfReader(BytesIO(file_bytes))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            revenue_items: dict[str, float] = {}
+            cost_items: dict[str, float] = {}
+            extracted_records: list[SourceRecord] = []
+            proportional_ratio: float | None = None
+            old_asset_formula: str | None = None
+            member_price_table: list[MemberPriceRecord] = []
+            table_pattern = re.compile(
+                r"(?P<label>\d+\s*[A-Za-z\uac00-\ud7a3]+)\s+"
+                r"(?P<exclusive>\d+(?:\.\d+)?)\s+"
+                r"(?P<supply>\d+(?:\.\d+)?)\s+"
+                r"(?P<price>\d[\d,]*(?:\.\d+)?\s*(?:\uc5b5|\ub9cc\uc6d0|\uc6d0)?)"
+            )
+            for line in lines:
+                compact = re.sub(r"\s+", "", line)
+                if "\ube44\ub840\uc728" in compact and proportional_ratio is None:
+                    pct_match = PERCENT_PATTERN.search(line)
+                    if pct_match:
+                        proportional_ratio = float(pct_match.group(1))
+                        extracted_records.append(record("proportional_ratio", f"{proportional_ratio:.2f}", f"PDF:{file_name}", 0.74))
+                if old_asset_formula is None and ("\uacf5\ub3d9\uc8fc\ud0dd" in compact or "\uacf5\uc2dc\uac00\uaca9" in compact) and ("x" in compact.lower() or "\u00d7" in compact):
+                    old_asset_formula = line[:200]
+                    extracted_records.append(record("old_asset_formula", old_asset_formula, f"PDF:{file_name}", 0.68))
+                for label, key in KEY_ALIASES.items():
+                    if label in compact:
+                        amount = parse_korean_money(line)
+                        if amount is None:
+                            continue
+                        if key in {"member_sale_revenue", "general_sale_revenue", "total_revenue"}:
+                            revenue_items[key] = amount
+                        else:
+                            cost_items[key] = amount
+                        extracted_records.append(record(key, f"{amount:,.0f}", f"PDF:{file_name}", 0.70))
+                for match in table_pattern.finditer(line):
+                    price = parse_korean_money(match.group("price"))
+                    if price is not None:
+                        member_price_table.append(
+                            MemberPriceRecord(
+                                label=match.group("label"),
+                                exclusive_area_sqm=float(match.group("exclusive")),
+                                supply_area_sqm=float(match.group("supply")),
+                                member_sale_price=price,
+                            )
                         )
-                    )
-        if member_price_table:
-            extracted_records.append(record("member_price_table_count", str(len(member_price_table)), f"PDF:{file_name}", 0.64))
-        return ParsedProjectNotice(
-            proportional_ratio=proportional_ratio,
-            old_asset_formula=old_asset_formula,
-            member_price_table=member_price_table[:12],
-            revenue_items=revenue_items,
-            cost_items=cost_items,
-            extracted_records=extracted_records,
-            source_name=file_name,
-        )
+            if member_price_table:
+                extracted_records.append(record("member_price_table_count", str(len(member_price_table)), f"PDF:{file_name}", 0.64))
+            return ParsedProjectNotice(
+                proportional_ratio=proportional_ratio,
+                old_asset_formula=old_asset_formula,
+                member_price_table=member_price_table[:12],
+                revenue_items=revenue_items,
+                cost_items=cost_items,
+                extracted_records=extracted_records,
+                source_name=file_name,
+            )
+        except Exception as exc:
+            return ParsedProjectNotice(
+                proportional_ratio=None,
+                old_asset_formula=None,
+                member_price_table=[],
+                revenue_items={},
+                cost_items={},
+                extracted_records=[record("parser_status", "parse_error", f"PDF:{file_name}", 0.10, str(exc)[:160])],
+                source_name=file_name,
+            )
 
     return ParsedProjectNotice(
         proportional_ratio=None,
@@ -423,6 +447,21 @@ def parse_uploaded_notice(file_name: str, file_bytes: bytes) -> ParsedProjectNot
         extracted_records=[record("parser_status", "unsupported", file_name, 0.10)],
         source_name=file_name,
     )
+
+
+def try_parse_uploaded_notice(file_name: str, file_bytes: bytes) -> ParsedProjectNotice:
+    try:
+        return parse_uploaded_notice(file_name, file_bytes)
+    except Exception as exc:
+        return ParsedProjectNotice(
+            proportional_ratio=None,
+            old_asset_formula=None,
+            member_price_table=[],
+            revenue_items={},
+            cost_items={},
+            extracted_records=[record("parser_status", "parse_error", file_name, 0.10, str(exc)[:160])],
+            source_name=file_name,
+        )
 
 
 def is_capital_area(address: str) -> bool:
@@ -758,7 +797,41 @@ def sensitivity_grid(inputs: dict, scenario_name: str, exit_name: str) -> pd.Dat
     return pd.DataFrame(rows)
 
 
+def format_project_value(item: str, value: float) -> str:
+    if item == "\uc77c\ubc18\ubd84\uc591 \uc5ec\ub825":
+        return f"{value * 100:.1f}%"
+    if item == "\ucd94\uc815\ube44\ub840\uc728":
+        return f"{value:.2f}%"
+    if item == "\ubcf4\uc815\uacc4\uc218":
+        return f"{value:.2f}"
+    return fmt_eok(value)
+
+
+def scenario_overview_frame(results: list[dict]) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for result in results:
+        completion_exit = next(item for item in result["exits"] if item["\uc5d1\uc2dc\ud2b8"] == "\uc900\uacf5 \uc9c1\ud6c4 \ub9e4\ub3c4")
+        rows.append(
+            {
+                "\uc2dc\ub098\ub9ac\uc624": result["scenario_name"],
+                "\uad8c\ub9ac\uac00\uc561": fmt_eok(result["rights_value"]),
+                "\ucd94\uc815\ube44\ub840\uc728": f"{result['project']['\ucd94\uc815\ube44\ub840\uc728']:.2f}%",
+                "\uc900\uacf5 \uc9c1\ud6c4 \uc138\ud6c4\uc21c\uc774\uc775": fmt_eok(completion_exit["\uc138\ud6c4 \uc21c\uc774\uc775"]),
+                "\uc2e0\ub8b0\ub3c4": f"{result['confidence_label']} ({result['confidence_score']:.1f}\uc810)",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def project_summary_frame(project_result: dict[str, float]) -> pd.DataFrame:
+    rows = []
+    for key, value in project_result.items():
+        rows.append({"\ud56d\ubaa9": key, "\uac12": format_project_value(key, float(value))})
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
+    return run_app()
     st.set_page_config(page_title="\uc7ac\uac74\ucd95 \ub9e4\uc218 \uc190\uc775 \ucd94\uc815\uae30", layout="wide")
     st.title("\uc11c\uc6b8\u00b7\uc218\ub3c4\uad8c \uc7ac\uac74\ucd95 \ub9e4\uc218 \uc190\uc775 \ucd94\uc815\uae30")
     st.caption("\uc77c\ubc18 \uc2a4\ud2b8\ub9bc\ub9bf \uc704\uc82f\ub9cc \uc0ac\uc6a9\ud558\ub294 \ub2e8\uc77c `app.py` \uad6c\uc131\uc785\ub2c8\ub2e4. \ubb38\uc11c \uc5c5\ub85c\ub4dc \uac12\uc740 \ubc14\ub85c \ubc18\uc601\ub418\uc9c0 \uc54a\uace0, \uc0ac\uc6a9\uc790\uac00 \uc120\ud0dd\ud55c \ud56d\ubaa9\ub9cc \uc801\uc6a9\ub429\ub2c8\ub2e4.")
@@ -1012,6 +1085,196 @@ def main() -> None:
             )
 
     st.warning("\ubc30\uc815\ud3c9\ud615, \uc138\uae08, \uc0ac\uc5c5\uc131 \ubcf4\uc815\uacc4\uc218\ub294 \ubc95\uc801 \ud655\uc815\uac12\uc774 \uc544\ub2c8\ub77c \uc758\uc0ac\uacb0\uc815 \ubcf4\uc870\uc6a9 \ucd94\uc815\uce58\uc785\ub2c8\ub2e4.")
+
+
+def run_app() -> None:
+    st.set_page_config(page_title="재건축 매수 손익 추정기", layout="wide")
+    st.title("서울·수도권 재건축 매수 손익 추정기")
+    st.caption("간편 사업성 흐름으로 먼저 보고, 필요한 경우에만 상세 설정을 펼쳐 조정하도록 정리했습니다.")
+
+    st.sidebar.header("설정")
+    scenario_focus = st.sidebar.selectbox("화면 기준 시나리오", list(SCENARIOS.keys()), index=1)
+    aggressive_upsize = st.sidebar.checkbox("공격적 평형 업사이즈 허용", value=False)
+    uploaded_files = st.sidebar.file_uploader("추정분담금 PDF / CSV 업로드", type=["pdf", "csv"], accept_multiple_files=True)
+
+    parsed_notices: list[ParsedProjectNotice] = []
+    if uploaded_files:
+        for file in uploaded_files:
+            parsed_notices.append(try_parse_uploaded_notice(file.name, file.getvalue()))
+    merged_notice = merge_notices(parsed_notices)
+    extracted_options: list[str] = []
+    if merged_notice:
+        extracted_options = sorted({item.key for item in merged_notice.extracted_records if item.key not in {"member_price_table_count", "parser_status"}})
+        st.sidebar.success(f"문서 {len(parsed_notices)}건 읽음")
+        st.sidebar.caption(f"파싱 문서: {merged_notice.source_name}")
+        for issue in [item for item in merged_notice.extracted_records if item.key == "parser_status"][:3]:
+            st.sidebar.warning(f"{issue.source}: {humanize_value(issue.value)}")
+    applied_document_fields = set(
+        st.sidebar.multiselect("적용할 문서 추출값", extracted_options, format_func=humanize_key)
+    )
+    use_doc_price_table = st.sidebar.checkbox("문서 분양가표 적용", value=False, disabled=not (merged_notice and merged_notice.member_price_table))
+    st.sidebar.caption("문서 숫자는 자동 확정되지 않습니다. 체크한 항목만 계산에 반영됩니다.")
+
+    with st.expander("1. 간편 입력", expanded=True):
+        st.caption("IndexerGO처럼 핵심 사업성 입력부터 먼저 보고, 금융/세금은 아래에서 보정합니다.")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            complex_name = st.text_input("단지명", value="압구정 예시 단지")
+            address = st.text_input("주소", value="서울특별시 강남구 압구정동")
+            current_stage = st.selectbox("현재 사업단계", list(STAGE_BASE_MONTHS.keys()), index=3)
+        with c2:
+            purchase_price_eok = st.number_input("매수가(억)", min_value=0.0, value=35.0, step=0.1)
+            current_unit_exclusive_area = st.number_input("현재 전용면적(㎡)", min_value=20.0, value=84.0, step=1.0)
+            current_unit_supply_area = st.number_input("현재 공급면적(㎡)", min_value=20.0, value=107.7, step=1.0)
+        with c3:
+            floor_no = st.number_input("층수", min_value=1, value=10, step=1)
+            public_price_eok = st.number_input("공시가격(억)", min_value=0.0, value=25.0, step=0.1)
+            recent_trade_price_eok = st.number_input("최근 실거래 중앙값(억)", min_value=0.0, value=34.0, step=0.1)
+        with c4:
+            comparison_new_price_eok = st.number_input("비교 신축 시세(억)", min_value=0.0, value=48.0, step=0.1)
+            expected_new_exclusive_area = st.number_input("예상 새 전용면적(㎡)", min_value=0.0, value=84.0, step=1.0)
+            general_sale_price_eok = st.number_input("일반분양 평균가(억)", min_value=0.0, value=14.0, step=0.1)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            current_households = st.number_input("기존 세대수", min_value=1, value=480, step=1)
+        with c2:
+            planned_households = st.number_input("예상 세대수", min_value=1, value=620, step=1)
+        with c3:
+            land_share = st.number_input("대지지분(㎡)", min_value=0.0, value=25.0, step=0.1)
+        with c4:
+            target_far = st.number_input("목표 용적률(%)", min_value=0.0, value=260.0, step=1.0)
+
+    with st.expander("2. 상세 설정", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            current_far = st.number_input("현황 용적률(%)", min_value=0.0, value=180.0, step=1.0)
+            general_sale_ratio_pct = st.number_input("일반분양 비율(%)", min_value=0.0, max_value=100.0, value=22.0, step=1.0)
+            construction_cost_per_pyeong_man = st.number_input("공사비(만원/평)", min_value=0.0, value=900.0, step=10.0)
+        with c2:
+            pf_rate_pct = st.number_input("PF 금리(%)", min_value=0.0, max_value=30.0, value=8.5, step=0.1)
+            move_loan_rate_pct = st.number_input("이주비 금리(%)", min_value=0.0, max_value=20.0, value=5.0, step=0.1)
+            sale_rate_pct = st.number_input("일반분양 판매율(%)", min_value=0.0, max_value=100.0, value=97.0, step=1.0)
+        with c3:
+            cash_settlement_rate_pct = st.number_input("현금청산률(%)", min_value=0.0, max_value=100.0, value=3.0, step=1.0)
+            delay_one_year = st.checkbox("1년 지연 반영", value=False)
+            reconstruction_levy_eok = st.number_input("재건축부담금(억)", min_value=0.0, value=0.0, step=0.1)
+        with c4:
+            appraised_old_asset_eok = st.number_input("내 감정가/종전자산가액(억)", min_value=0.0, value=0.0, step=0.1)
+            total_old_asset_value_eok = st.number_input("단지 종전자산총액(억)", min_value=0.0, value=0.0, step=1.0)
+            adjustment_factor_override = st.number_input("보정계수 직접 입력", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            ancillary_revenue_eok = st.number_input("부대복리/상가 수입(억)", min_value=0.0, value=0.0, step=0.1)
+        with c2:
+            other_disposal_revenue_eok = st.number_input("기타 처분수입(억)", min_value=0.0, value=0.0, step=0.1)
+        with c3:
+            liquidation_cost_eok = st.number_input("청산/소송 비용(억)", min_value=0.0, value=0.0, step=0.1)
+        with c4:
+            public_land_price_avg = st.number_input("대상지 평균 공시지가(원/㎡)", min_value=0.0, value=32_000_000.0, step=100_000.0)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            apply_seoul_business_boost = st.checkbox("서울 사업성 보정계수 적용", value=False)
+        with c2:
+            seoul_average_public_land_price = st.number_input("서울 평균 공시지가", min_value=0.0, value=43_000_000.0, step=100_000.0)
+        with c3:
+            alpha = st.number_input("보정계수 가산값 알파", value=0.0, step=0.01, format="%.2f")
+            beta = st.number_input("보정계수 가산값 베타", value=0.0, step=0.01, format="%.2f")
+        member_price_text = st.text_area("조합원 분양가표: `타입,전용,공급,분양가(억)`", value="59형,59,75.6,8.5\n84형,84,107.7,12.0\n101형,101,129.5,15.0", height=120)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            acquisition_rate_pct = st.number_input("취득세 실효세율(%)", min_value=0.0, max_value=100.0, value=1.5, step=0.1)
+        with c2:
+            annual_holding_rate_pct = st.number_input("연 보유비용률(%)", min_value=0.0, max_value=100.0, value=0.3, step=0.1)
+        with c3:
+            capital_gains_effective_rate_pct = st.number_input("양도세 실효세율(%)", min_value=0.0, max_value=100.0, value=20.0, step=0.5)
+        with c4:
+            brokerage_rate_pct = st.number_input("중개/처분비율(%)", min_value=0.0, max_value=100.0, value=0.4, step=0.1)
+
+    inputs = {
+        "complex_name": complex_name, "address": address, "current_stage": current_stage,
+        "purchase_price": won_from_eok(purchase_price_eok), "current_unit_supply_area": current_unit_supply_area,
+        "current_unit_exclusive_area": current_unit_exclusive_area, "floor_no": int(floor_no),
+        "expected_new_exclusive_area": expected_new_exclusive_area or None,
+        "comparison_new_apt_price": won_from_eok(comparison_new_price_eok) if comparison_new_price_eok else None,
+        "recent_same_complex_trade_price": won_from_eok(recent_trade_price_eok) if recent_trade_price_eok else None,
+        "public_price": won_from_eok(public_price_eok) if public_price_eok else None,
+        "appraised_old_asset_value": won_from_eok(appraised_old_asset_eok) if appraised_old_asset_eok else None,
+        "land_share": land_share or None, "current_households": int(current_households), "planned_households": int(planned_households),
+        "current_far": current_far or None, "target_far": target_far or None, "construction_cost_per_pyeong": construction_cost_per_pyeong_man * 10_000,
+        "pf_rate": pf_rate_pct / 100.0, "move_loan_rate": move_loan_rate_pct / 100.0,
+        "general_sale_price": won_from_eok(general_sale_price_eok) if general_sale_price_eok else None,
+        "general_sale_ratio": general_sale_ratio_pct / 100.0, "sale_rate": sale_rate_pct / 100.0, "cash_settlement_rate": cash_settlement_rate_pct / 100.0,
+        "delay_one_year": delay_one_year, "apply_seoul_business_boost": apply_seoul_business_boost, "public_land_price_avg": public_land_price_avg or None,
+        "seoul_average_public_land_price": seoul_average_public_land_price, "alpha": alpha, "beta": beta,
+        "total_old_asset_value": won_from_eok(total_old_asset_value_eok) if total_old_asset_value_eok else None,
+        "document_total_old_asset_value": merged_notice.cost_items.get("total_old_asset_value") if merged_notice else None,
+        "adjustment_factor_override": adjustment_factor_override or None, "reconstruction_levy": won_from_eok(reconstruction_levy_eok),
+        "liquidation_cost_override": won_from_eok(liquidation_cost_eok) if liquidation_cost_eok else None,
+        "ancillary_revenue": won_from_eok(ancillary_revenue_eok), "other_disposal_revenue": won_from_eok(other_disposal_revenue_eok),
+        "member_price_text": member_price_text, "parsed_notice": merged_notice, "applied_document_fields": applied_document_fields,
+        "use_doc_price_table": use_doc_price_table, "aggressive_upsize": aggressive_upsize,
+        "acquisition_rate": acquisition_rate_pct / 100.0, "annual_holding_rate": annual_holding_rate_pct / 100.0,
+        "capital_gains_effective_rate": capital_gains_effective_rate_pct / 100.0, "brokerage_rate": brokerage_rate_pct / 100.0,
+    }
+
+    results = [analyze_scenario(inputs, scenario_name) for scenario_name in SCENARIOS]
+    focus_result = next(item for item in results if item["scenario_name"] == scenario_focus)
+    focus_exit = next(item for item in focus_result["exits"] if item["\uc5d1\uc2dc\ud2b8"] == "\uc900\uacf5 \uc9c1\ud6c4 \ub9e4\ub3c4")
+    if focus_result["old_asset_source"] == "purchase_price_heuristic":
+        st.warning("공시가격, 실거래가, 감정가 입력이 없어 종전자산이 매수가 기반 휴리스틱으로 추정되고 있습니다.")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("권리가액", fmt_eok(focus_result["rights_value"]), f"추정비례율 {focus_result['project']['\ucd94\uc815\ube44\ub840\uc728']:.2f}%")
+    c2.metric("추천 배정평형", focus_result["selected"]["\ud3c9\ud615"], f"추가분담금 {fmt_eok(focus_result['selected']['\uc608\uc0c1 \ucd94\uac00\ubd84\ub2f4\uae08'])}")
+    c3.metric("종전자산 추정", fmt_eok(focus_result["old_asset_estimate"]), humanize_source(focus_result["old_asset_source"]))
+    c4.metric("준공 직후 세후순이익", fmt_eok(focus_exit["\uc138\ud6c4 \uc21c\uc774\uc775"]), f"투자수익률 {focus_exit['ROI'] * 100:.1f}%")
+    c5.metric("신뢰도", focus_result["confidence_label"], f"{focus_result['confidence_score']:.1f}점")
+
+    tab1, tab2, tab3 = st.tabs(["핵심 결과", "손익 시나리오", "상세 근거"])
+    with tab1:
+        st.dataframe(scenario_overview_frame(results), use_container_width=True, hide_index=True)
+        left, right = st.columns([1.1, 0.9])
+        with left:
+            st.markdown("#### 기준 시나리오 사업성")
+            st.dataframe(project_summary_frame(focus_result["project"]), use_container_width=True, hide_index=True)
+        with right:
+            allocation_frame = pd.DataFrame(focus_result["allocations"])
+            st.markdown("#### 배정평형 추천")
+            if allocation_frame.empty:
+                st.info("추천 가능한 배정평형이 없습니다. 분양가표나 업사이즈 설정을 확인해 주세요.")
+            else:
+                allocation_frame["\uc870\ud569\uc6d0\ubd84\uc591\uac00"] = allocation_frame["\uc870\ud569\uc6d0\ubd84\uc591\uac00"].map(fmt_eok)
+                allocation_frame["\uc608\uc0c1 \ucd94\uac00\ubd84\ub2f4\uae08"] = allocation_frame["\uc608\uc0c1 \ucd94\uac00\ubd84\ub2f4\uae08"].map(fmt_eok)
+                allocation_frame["\ucee4\ubc84\uc728"] = allocation_frame["\ucee4\ubc84\uc728"].map(lambda x: f"{x * 100:.1f}%")
+                allocation_frame["\uc810\uc218"] = allocation_frame["\uc810\uc218"].map(lambda x: round(x, 3))
+                st.dataframe(allocation_frame, use_container_width=True, hide_index=True)
+    with tab2:
+        scenario_choice = st.radio("손익표 기준 시나리오", list(SCENARIOS.keys()), horizontal=True, index=list(SCENARIOS.keys()).index(scenario_focus))
+        pnl_result = next(item for item in results if item["scenario_name"] == scenario_choice)
+        exit_frame = pd.DataFrame(pnl_result["exits"])
+        for column in ["\uc790\uc0b0\uac00\uce58", "\uc138\uc804 \uc21c\uc774\uc775", "\uc138\ud6c4 \uc21c\uc774\uc775", "\uc190\uc775\ubd84\uae30 \ub9e4\uc218\uac00", "\uc190\uc775\ubd84\uae30 \ucd94\uac00\ubd84\ub2f4\uae08", "\uc190\uc775\ubd84\uae30 \uc900\uacf5\uc2dc\uc138"]:
+            exit_frame[column] = exit_frame[column].map(fmt_eok)
+        exit_frame["ROI"] = exit_frame["ROI"].map(lambda x: f"{x * 100:.2f}%")
+        exit_frame["IRR"] = exit_frame["IRR"].map(lambda x: "-" if x is None else f"{x * 100:.2f}%")
+        exit_frame["\uc608\uc0c1 \uc2dc\uc810(\ub144)"] = exit_frame["\uc608\uc0c1 \uc2dc\uc810(\ub144)"].map(lambda x: round(x, 2))
+        st.dataframe(exit_frame.rename(columns={"ROI": "\ud22c\uc790\uc218\uc775\ub960", "IRR": "\uc5f0\ud658\uc0b0 IRR"}), use_container_width=True, hide_index=True)
+    with tab3:
+        with st.expander("사업수지 상세", expanded=True):
+            st.dataframe(project_summary_frame(focus_result["project"]), use_container_width=True, hide_index=True)
+        with st.expander("민감도", expanded=False):
+            grid = sensitivity_grid(inputs, scenario_focus, "\uc900\uacf5 \uc9c1\ud6c4 \ub9e4\ub3c4")
+            matrix = grid.pivot(index="\ud310\ub9e4\uc728(%)", columns="\uacf5\uc0ac\ube44\ubc30\uc218", values="\uc138\ud6c4 \uc21c\uc774\uc775(\uc5b5)")
+            st.dataframe(matrix, use_container_width=True)
+        with st.expander("문서 추출 결과", expanded=False):
+            if merged_notice:
+                st.dataframe(localized_records_frame(merged_notice.extracted_records), use_container_width=True, hide_index=True)
+            else:
+                st.info("업로드된 문서가 없습니다.")
+        with st.expander("계산 근거", expanded=False):
+            st.dataframe(localized_records_frame(focus_result["source_records"]), use_container_width=True, hide_index=True)
+        with st.expander("참고 링크", expanded=False):
+            st.markdown("- [도시 및 주거환경정비법 제74조](https://www.law.go.kr/lsLinkCommonInfo.do?lsJoLnkSeq=1019994219&chrClsCd=010202&ancYnChk=)\n- [법제처 해석례 2020-02-26](https://www.law.go.kr/LSW/expcInfoP.do?expcSeq=326815&mode=2)\n- [서울시 사업비 및 분담금 추정프로그램 매뉴얼](https://cleanup.seoul.go.kr/sures/doc/sures_manual.pdf)\n- [서울시보 2023-04-27 공식 예시](https://event.seoul.go.kr/snews/data/CN_MST/seoulsibo_20230426151204_73863.pdf)\n- [강남구 재건축 단계 설명](https://www.gangnam.go.kr/gangnamlife/2026/html/vol366/sub01_02.html)\n- [서울 사업성 보정계수 설명 자료](https://ms.smc.seoul.kr/record/appendixDownload.do?key=118e605f12016d435ddd98e70cdefdd7d5ee060b2796116ed8093838d547cf058188275887c9d3b1)\n- [참고한 간편 계산기 흐름](https://www.indexergo.com/calculator/?calculatorType=reconstruction)")
+    st.warning("배정평형, 세금, 사업성 보정계수는 법적 확정값이 아니라 투자 판단 보조용 추정치입니다.")
 
 
 if __name__ == "__main__":
