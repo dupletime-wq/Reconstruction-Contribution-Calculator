@@ -570,16 +570,22 @@ def analyze_scenario(inputs: dict, scenario_name: str) -> dict:
         expected_new_area=inputs["expected_new_exclusive_area"],
     )
 
-    if inputs["land_share"] and inputs["target_far"]:
-        land_area_sqm = inputs["land_share"] * inputs["current_households"]
-        gross_floor_area_sqm = land_area_sqm * (inputs["target_far"] / 100.0)
+    current_gross_floor_area_sqm = inputs["current_households"] * inputs["current_unit_supply_area"] * 1.08
+    site_area_sqm = None
+    if inputs["land_share"]:
+        site_area_sqm = inputs["land_share"] * inputs["current_households"]
+    elif inputs["current_far"]:
+        site_area_sqm = current_gross_floor_area_sqm / max(inputs["current_far"] / 100.0, 0.01)
+    elif inputs.get("building_coverage_ratio") and inputs.get("average_current_floors"):
+        site_area_sqm = current_gross_floor_area_sqm / max(inputs["building_coverage_ratio"] * inputs["average_current_floors"], 0.01)
+
+    if site_area_sqm and inputs["target_far"]:
+        gross_floor_area_sqm = site_area_sqm * (inputs["target_far"] / 100.0)
     elif inputs["current_far"] and inputs["target_far"]:
-        current_gross_floor_area_sqm = inputs["current_households"] * inputs["current_unit_supply_area"] * 1.08
         gross_floor_area_sqm = current_gross_floor_area_sqm * safe_div(inputs["target_far"], inputs["current_far"], 1.0)
     else:
         avg_supply = statistics.mean(item.supply_area_sqm for item in price_table)
         gross_floor_area_sqm = inputs["planned_households"] * avg_supply * 1.15
-    current_gross_floor_area_sqm = inputs["current_households"] * inputs["current_unit_supply_area"] * 1.08
     gross_floor_area_pyeong = gross_floor_area_sqm / 3.3058
     current_gross_area_pyeong = current_gross_floor_area_sqm / 3.3058
 
@@ -590,11 +596,17 @@ def analyze_scenario(inputs: dict, scenario_name: str) -> dict:
     design_and_pm_cost = direct_construction_cost * 0.06
     reserve_cost = (direct_construction_cost + design_and_pm_cost + demolition_cost) * 0.05
 
+    donation_ratio = clamp(inputs.get("donation_ratio", 0.0), 0.0, 0.40)
+    rental_ratio = clamp(inputs.get("rental_ratio", 0.0), 0.0, 0.40)
+    saleable_area_factor = clamp(1.0 - donation_ratio, 0.55, 1.0)
     member_count = max(int(round(inputs["current_households"] * (1 - base_cash_rate))), 1)
-    general_sale_households = max(inputs["planned_households"] - member_count, 0)
+    rental_households = int(round(inputs["planned_households"] * rental_ratio))
+    saleable_households_capacity = max(int(round(inputs["planned_households"] * saleable_area_factor)) - rental_households, member_count)
     if inputs["general_sale_ratio"] is not None:
-        general_sale_households = max(int(round(inputs["planned_households"] * inputs["general_sale_ratio"])), 0)
-        member_count = max(inputs["planned_households"] - general_sale_households, 1)
+        ratio_based_general_sale = int(round(max(inputs["planned_households"] - rental_households, 0) * inputs["general_sale_ratio"]))
+        general_sale_households = max(min(ratio_based_general_sale, saleable_households_capacity - member_count), 0)
+    else:
+        general_sale_households = max(saleable_households_capacity - member_count, 0)
 
     average_member_sale_price = statistics.mean(item.member_sale_price for item in price_table)
     benchmark_new_price = inputs["comparison_new_apt_price"] or inputs["general_sale_price"] or average_member_sale_price / 0.85
@@ -613,9 +625,6 @@ def analyze_scenario(inputs: dict, scenario_name: str) -> dict:
     move_loan_interest_cost = member_count * (old_asset_estimate * 0.40) * inputs["move_loan_rate"] * (move_loan_months / 12.0)
 
     business_boost = 1.0
-    if inputs["apply_seoul_business_boost"] and ("\uc11c\uc6b8" in inputs["address"] or "Seoul" in inputs["address"]) and inputs["public_land_price_avg"]:
-        business_boost = clamp(safe_div(inputs["seoul_average_public_land_price"], inputs["public_land_price_avg"], 1.0) + inputs["alpha"] + inputs["beta"], 1.0, 2.0)
-        general_sale_revenue *= 1 + 0.06 * (business_boost - 1.0)
 
     parsed_notice = inputs["parsed_notice"]
     if parsed_notice and "member_sale_revenue" in inputs["applied_document_fields"] and "member_sale_revenue" in parsed_notice.revenue_items:
@@ -760,6 +769,10 @@ def analyze_scenario(inputs: dict, scenario_name: str) -> dict:
             "\ucd94\uc815\ube44\ub840\uc728": proportional_ratio,
             "\uc138\ub300\ub2f9 \ud3c9\uade0 \ubd84\ub2f4\uae08": max(average_member_sale_price - old_asset_estimate * (proportional_ratio / 100.0), 0.0),
             "\uc77c\ubc18\ubd84\uc591 \uc5ec\ub825": safe_div(general_sale_households, inputs["planned_households"], 0.0),
+            "\uc77c\ubc18\ubd84\uc591 \uc138\ub300\uc218": float(general_sale_households),
+            "\uc784\ub300\uc8fc\ud0dd \uc138\ub300\uc218": float(rental_households),
+            "\uae30\ubd80\ucc44\ub0a9 \ube44\uc728": donation_ratio,
+            "\uc784\ub300\uc8fc\ud0dd \ube44\uc728": rental_ratio,
             "\uc9c1\uc811\uacf5\uc0ac\ube44": direct_construction_cost,
             "\ucca0\uac70/\uc815\ube44\uae30\ubc18": demolition_cost,
             "\uc124\uacc4/\uac10\ub9ac/PM": design_and_pm_cost,
@@ -769,7 +782,6 @@ def analyze_scenario(inputs: dict, scenario_name: str) -> dict:
             "\ubd84\uc591\uacbd\ube44": sales_expense,
             "\uc81c\uc138\uacf5\uacfc\uae08": tax_and_charge_cost,
             "\uccad\uc0b0/\uc18c\uc1a1\ube44\uc6a9": settlement_and_litigation_cost,
-            "\ubcf4\uc815\uacc4\uc218": business_boost,
         },
         "exits": exits,
         "confidence_score": confidence_score,
@@ -798,8 +810,10 @@ def sensitivity_grid(inputs: dict, scenario_name: str, exit_name: str) -> pd.Dat
 
 
 def format_project_value(item: str, value: float) -> str:
-    if item == "\uc77c\ubc18\ubd84\uc591 \uc5ec\ub825":
+    if item in {"\uc77c\ubc18\ubd84\uc591 \uc5ec\ub825", "\uae30\ubd80\ucc44\ub0a9 \ube44\uc728", "\uc784\ub300\uc8fc\ud0dd \ube44\uc728"}:
         return f"{value * 100:.1f}%"
+    if item in {"\uc784\ub300\uc8fc\ud0dd \uc138\ub300\uc218", "\uc77c\ubc18\ubd84\uc591 \uc138\ub300\uc218"}:
+        return f"{value:,.0f}\uc138\ub300"
     if item == "\ucd94\uc815\ube44\ub840\uc728":
         return f"{value:.2f}%"
     if item == "\ubcf4\uc815\uacc4\uc218":
@@ -1128,8 +1142,8 @@ def run_app() -> None:
             current_unit_supply_area = st.number_input("현재 공급면적(㎡)", min_value=20.0, value=107.7, step=1.0)
         with c3:
             floor_no = st.number_input("층수", min_value=1, value=10, step=1)
-            public_price_eok = st.number_input("공시가격(억)", min_value=0.0, value=25.0, step=0.1)
             recent_trade_price_eok = st.number_input("최근 실거래 중앙값(억)", min_value=0.0, value=34.0, step=0.1)
+            current_far = st.number_input("현황 용적률(%)", min_value=0.0, value=180.0, step=1.0)
         with c4:
             comparison_new_price_eok = st.number_input("비교 신축 시세(억)", min_value=0.0, value=48.0, step=0.1)
             expected_new_exclusive_area = st.number_input("예상 새 전용면적(㎡)", min_value=0.0, value=84.0, step=1.0)
@@ -1143,11 +1157,11 @@ def run_app() -> None:
             land_share = st.number_input("대지지분(㎡)", min_value=0.0, value=25.0, step=0.1)
         with c4:
             target_far = st.number_input("목표 용적률(%)", min_value=0.0, value=260.0, step=1.0)
+        st.caption("대지지분을 입력하면 우선 사용합니다. 대지지분이 없으면 현황 용적률, 그것도 없으면 건폐율+기존 평균층수로 대지면적을 추정합니다.")
 
     with st.expander("2. 상세 설정", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            current_far = st.number_input("현황 용적률(%)", min_value=0.0, value=180.0, step=1.0)
             general_sale_ratio_pct = st.number_input("일반분양 비율(%)", min_value=0.0, max_value=100.0, value=22.0, step=1.0)
             construction_cost_per_pyeong_man = st.number_input("공사비(만원/평)", min_value=0.0, value=900.0, step=10.0)
         with c2:
@@ -1164,21 +1178,23 @@ def run_app() -> None:
             adjustment_factor_override = st.number_input("보정계수 직접 입력", min_value=0.0, value=0.0, step=0.01, format="%.2f")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
+            public_price_eok = st.number_input("공동주택 공시가격(억)", min_value=0.0, value=25.0, step=0.1)
             ancillary_revenue_eok = st.number_input("부대복리/상가 수입(억)", min_value=0.0, value=0.0, step=0.1)
         with c2:
+            donation_ratio_pct = st.number_input("기부채납 비율(%)", min_value=0.0, max_value=50.0, value=8.0, step=1.0)
             other_disposal_revenue_eok = st.number_input("기타 처분수입(억)", min_value=0.0, value=0.0, step=0.1)
         with c3:
+            rental_ratio_pct = st.number_input("임대주택 비율(%)", min_value=0.0, max_value=50.0, value=10.0, step=1.0)
             liquidation_cost_eok = st.number_input("청산/소송 비용(억)", min_value=0.0, value=0.0, step=0.1)
         with c4:
-            public_land_price_avg = st.number_input("대상지 평균 공시지가(원/㎡)", min_value=0.0, value=32_000_000.0, step=100_000.0)
+            building_coverage_ratio_pct = st.number_input("건폐율(%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
         c1, c2, c3 = st.columns(3)
         with c1:
-            apply_seoul_business_boost = st.checkbox("서울 사업성 보정계수 적용", value=False)
+            average_current_floors = st.number_input("기존 평균 층수", min_value=0.0, value=0.0, step=1.0)
         with c2:
-            seoul_average_public_land_price = st.number_input("서울 평균 공시지가", min_value=0.0, value=43_000_000.0, step=100_000.0)
+            st.caption("기부채납과 임대주택 비율은 일반분양 여력과 수익성에 직접 반영됩니다.")
         with c3:
-            alpha = st.number_input("보정계수 가산값 알파", value=0.0, step=0.01, format="%.2f")
-            beta = st.number_input("보정계수 가산값 베타", value=0.0, step=0.01, format="%.2f")
+            st.caption("건폐율은 대지지분이 없을 때만 보조 추정에 사용합니다.")
         member_price_text = st.text_area("조합원 분양가표: `타입,전용,공급,분양가(억)`", value="59형,59,75.6,8.5\n84형,84,107.7,12.0\n101형,101,129.5,15.0", height=120)
         c1, c2, c3, c4 = st.columns(4)
         with c1:
@@ -1201,11 +1217,14 @@ def run_app() -> None:
         "appraised_old_asset_value": won_from_eok(appraised_old_asset_eok) if appraised_old_asset_eok else None,
         "land_share": land_share or None, "current_households": int(current_households), "planned_households": int(planned_households),
         "current_far": current_far or None, "target_far": target_far or None, "construction_cost_per_pyeong": construction_cost_per_pyeong_man * 10_000,
+        "building_coverage_ratio": building_coverage_ratio_pct / 100.0 if building_coverage_ratio_pct else None,
+        "average_current_floors": average_current_floors or None,
+        "donation_ratio": donation_ratio_pct / 100.0,
+        "rental_ratio": rental_ratio_pct / 100.0,
         "pf_rate": pf_rate_pct / 100.0, "move_loan_rate": move_loan_rate_pct / 100.0,
         "general_sale_price": won_from_eok(general_sale_price_eok) if general_sale_price_eok else None,
         "general_sale_ratio": general_sale_ratio_pct / 100.0, "sale_rate": sale_rate_pct / 100.0, "cash_settlement_rate": cash_settlement_rate_pct / 100.0,
-        "delay_one_year": delay_one_year, "apply_seoul_business_boost": apply_seoul_business_boost, "public_land_price_avg": public_land_price_avg or None,
-        "seoul_average_public_land_price": seoul_average_public_land_price, "alpha": alpha, "beta": beta,
+        "delay_one_year": delay_one_year,
         "total_old_asset_value": won_from_eok(total_old_asset_value_eok) if total_old_asset_value_eok else None,
         "document_total_old_asset_value": merged_notice.cost_items.get("total_old_asset_value") if merged_notice else None,
         "adjustment_factor_override": adjustment_factor_override or None, "reconstruction_levy": won_from_eok(reconstruction_levy_eok),
@@ -1274,7 +1293,7 @@ def run_app() -> None:
             st.dataframe(localized_records_frame(focus_result["source_records"]), use_container_width=True, hide_index=True)
         with st.expander("참고 링크", expanded=False):
             st.markdown("- [도시 및 주거환경정비법 제74조](https://www.law.go.kr/lsLinkCommonInfo.do?lsJoLnkSeq=1019994219&chrClsCd=010202&ancYnChk=)\n- [법제처 해석례 2020-02-26](https://www.law.go.kr/LSW/expcInfoP.do?expcSeq=326815&mode=2)\n- [서울시 사업비 및 분담금 추정프로그램 매뉴얼](https://cleanup.seoul.go.kr/sures/doc/sures_manual.pdf)\n- [서울시보 2023-04-27 공식 예시](https://event.seoul.go.kr/snews/data/CN_MST/seoulsibo_20230426151204_73863.pdf)\n- [강남구 재건축 단계 설명](https://www.gangnam.go.kr/gangnamlife/2026/html/vol366/sub01_02.html)\n- [서울 사업성 보정계수 설명 자료](https://ms.smc.seoul.kr/record/appendixDownload.do?key=118e605f12016d435ddd98e70cdefdd7d5ee060b2796116ed8093838d547cf058188275887c9d3b1)\n- [참고한 간편 계산기 흐름](https://www.indexergo.com/calculator/?calculatorType=reconstruction)")
-    st.warning("배정평형, 세금, 사업성 보정계수는 법적 확정값이 아니라 투자 판단 보조용 추정치입니다.")
+    st.warning("배정평형과 세금, 임대/기부채납 반영치는 법적 확정값이 아니라 투자 판단 보조용 추정치입니다.")
 
 
 if __name__ == "__main__":
