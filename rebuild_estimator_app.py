@@ -482,6 +482,10 @@ def won_from_eok(value: float) -> float:
     return float(value) * 100_000_000.0
 
 
+def eok_from_won(value: float | None) -> float:
+    return 0.0 if value is None else float(value) / 100_000_000.0
+
+
 def fmt_money(value: float | None) -> str:
     if value is None:
         return "-"
