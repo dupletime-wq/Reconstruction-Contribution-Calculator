@@ -2665,7 +2665,7 @@ def main() -> None:
             use_doc_price_table = st.checkbox("문서 분양가표 사용", value=False, disabled=not merged_notice.member_price_table)
             st.caption("문서 숫자는 자동 확정하지 않습니다. 체크한 값만 계산에 넣습니다.")
 
-        quick_inputs = QuickDealInputs(
+    quick_inputs = QuickDealInputs(
         project_kind=project_kind,
         scenario_profile=assumption_profile,
         current_stage=current_stage,
