@@ -183,6 +183,7 @@ FIELD_HELP: dict[str, str] = {
     "current_stage": "현재 사업단계입니다. 남은 사업기간, 금융비, 공사비 인플레이션에 직접 반영됩니다.",
     "comparison_new_price": "준공 후 이 매물이 따라갈 가능성이 있는 신축 시세입니다. 현재 매물가가 아니라 출구가격 앵커입니다.",
     "general_sale_price": "준공 또는 분양 시점 기준의 예상 일반분양 평균가입니다. 현재 주변 실거래가와 같은 뜻이 아닙니다.",
+    "general_sale_price_basis_area": "입력한 일반분양 평균가가 어느 전용면적 기준인지 적는 값입니다. 예를 들어 84㎡ 기준 14억이면 84를 넣어야 다른 평형으로 합리적으로 환산할 수 있습니다.",
     "current_households": "재건축은 기존 세대수, 재개발은 토지등소유자 수 또는 분양대상 권리자 수에 가깝게 입력할수록 정확합니다.",
     "current_far": "현재 구역의 현황 용적률입니다. 대지지분이나 공식 대지면적이 없을 때 대지면적 역산에 사용합니다.",
     "target_far": "정비계획 또는 예상 정비계획 기준 목표 용적률입니다. 총세대수 시뮬레이션의 핵심 값입니다.",
@@ -322,6 +323,7 @@ class QuickDealInputs:
     current_unit_supply_area: float
     comparison_new_price: float | None
     general_sale_price: float | None
+    general_sale_price_basis_exclusive_area: float | None
     current_households: int
     current_far: float | None
     target_far: float | None
@@ -512,6 +514,12 @@ def fmt_settlement(value: float | None) -> str:
     return "정산 없음"
 
 
+def scale_price_by_area(anchor_price: float, anchor_exclusive_area: float | None, target_exclusive_area: float | None) -> float:
+    base_area = max(float(anchor_exclusive_area or 0.0), 1.0)
+    target_area = max(float(target_exclusive_area or base_area), 1.0)
+    return float(anchor_price) * ((target_area / base_area) ** 0.98)
+
+
 def fmt_pct(value: float | None) -> str:
     if value is None:
         return "-"
@@ -611,6 +619,7 @@ def default_member_price_table(
     project_kind: ProjectKind,
     comparison_new_price: float | None,
     general_sale_price: float | None,
+    general_sale_price_basis_exclusive_area: float | None,
     purchase_price: float,
     current_exclusive_area: float,
     expected_new_area: float | None,
@@ -620,7 +629,6 @@ def default_member_price_table(
         return text_table
     if use_doc_table and doc_table:
         return doc_table
-    base_market_price = comparison_new_price or general_sale_price or purchase_price * 1.45
     base_exclusive = expected_new_area or max(current_exclusive_area, 59.0)
     if project_kind == ProjectKind.REDEVELOPMENT:
         sizes = sorted({59.0, 74.0, 84.0, round(base_exclusive)})
@@ -628,8 +636,13 @@ def default_member_price_table(
         sizes = sorted({59.0, 84.0, 101.0, round(base_exclusive)})
     rows: list[MemberPriceRecord] = []
     for size in sizes:
-        area_ratio = safe_div(size, base_exclusive, 1.0)
-        member_price = base_market_price * (area_ratio**0.98) * 0.85
+        if general_sale_price:
+            market_price = scale_price_by_area(general_sale_price, general_sale_price_basis_exclusive_area or 84.0, size)
+        elif comparison_new_price:
+            market_price = scale_price_by_area(comparison_new_price, base_exclusive, size)
+        else:
+            market_price = scale_price_by_area(purchase_price * 1.45, base_exclusive, size)
+        member_price = market_price * 0.85
         rows.append(MemberPriceRecord(label=f"{int(size)}형", exclusive_area_sqm=float(size), supply_area_sqm=round(size / 0.78, 2), member_sale_price=member_price))
     return rows
 
@@ -1503,12 +1516,18 @@ def estimate_remaining_months(stage: str, autofill: AutofillProjectData | None, 
         matches = DATE_RANGE_PATTERN.findall(schedule_text)
         if matches:
             try:
-                start_text = matches[0][0].replace(".", "-").replace("/", "-")
-                year, month = [int(part) for part in start_text.split("-")[:2]]
                 now = datetime.now()
-                delta_months = max((year - now.year) * 12 + (month - now.month), 0)
-                base_months = max(delta_months, 6)
-                source = "schedule_board"
+                delta_months_candidates: list[int] = []
+                for start_text, end_text in matches:
+                    for candidate_text in (start_text, end_text):
+                        if not candidate_text:
+                            continue
+                        normalized = candidate_text.replace(".", "-").replace("/", "-")
+                        year, month = [int(part) for part in normalized.split("-")[:2]]
+                        delta_months_candidates.append(max((year - now.year) * 12 + (month - now.month), 0))
+                if delta_months_candidates:
+                    base_months = max(max(delta_months_candidates), 6)
+                    source = "schedule_board"
             except Exception:
                 source = "manual"
     months = base_months * scenario["duration_multiplier"] * profile["duration_buffer"]
@@ -1631,6 +1650,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         project_kind=quick_inputs.project_kind,
         comparison_new_price=quick_inputs.comparison_new_price,
         general_sale_price=quick_inputs.general_sale_price,
+        general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
         purchase_price=quick_inputs.purchase_price,
         current_exclusive_area=quick_inputs.current_unit_exclusive_area,
         expected_new_area=rights_inputs.expected_new_exclusive_area,
@@ -1657,7 +1677,16 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     average_member_sale_price = statistics.mean(item.member_sale_price for item in price_table)
     benchmark_new_price = quick_inputs.comparison_new_price or quick_inputs.general_sale_price or average_member_sale_price / 0.85
     member_sale_revenue = member_count * average_member_sale_price
-    general_sale_unit_price = quick_inputs.general_sale_price or benchmark_new_price
+    general_sale_reference_exclusive_area = max(simulation.average_supply_area_sqm * 0.78, 1.0)
+    if quick_inputs.general_sale_price:
+        general_sale_unit_price = scale_price_by_area(
+            quick_inputs.general_sale_price,
+            quick_inputs.general_sale_price_basis_exclusive_area or 84.0,
+            general_sale_reference_exclusive_area,
+        )
+    else:
+        benchmark_anchor_area = rights_inputs.expected_new_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0
+        general_sale_unit_price = scale_price_by_area(benchmark_new_price, benchmark_anchor_area, general_sale_reference_exclusive_area)
     general_sale_revenue = general_sale_households * general_sale_unit_price * base_sale_rate
     ancillary_revenue = advanced_inputs.ancillary_revenue or direct_construction_cost * 0.02
     other_disposal_revenue = advanced_inputs.other_disposal_revenue or direct_construction_cost * 0.01
@@ -2275,6 +2304,7 @@ def render_input_guide(project_kind: ProjectKind) -> None:
         "<div class='soft-title'>입력 가이드</div>"
         "<p class='mini-note'>이 계산기는 ROI보다 평형별 정산액(추가분담 또는 환급)과 손익분기 매수가를 먼저 보여주도록 설계했습니다. ROI는 하단 시나리오 표에서 보조지표로만 확인하세요.</p>"
         "<p class='mini-note'>일반분양 평균가는 준공 또는 분양 시점 기준의 예상 일반분양 평균가입니다. 현재 주변 실거래가와 같은 의미가 아닙니다.</p>"
+        "<p class='mini-note'>일반분양가는 반드시 기준 전용면적과 같이 넣어야 합니다. 예를 들어 84㎡ 기준 14억인데 59㎡에 그대로 쓰면 사업수지가 크게 왜곡됩니다.</p>"
         "<p class='mini-note'>목표 용적률과 목표 건폐율을 같이 넣으면 총세대수와 평균층수를 자동 점검합니다. 목표 건폐율이 없으면 세대수 과다 경고는 약해집니다.</p>"
         "<p class='mini-note'>기부채납 비율은 도로·공원·공공시설로 빠지는 면적을 묶어 반영한 간편값이며, 공식 토지이용계획이 있으면 그 값이 우선합니다.</p>"
         "<p class='mini-note'>임대주택 비율은 공식 주택공급계획이 있으면 그 값이 우선하고, 없으면 사업유형과 프리셋으로 자동 추정합니다.</p>"
@@ -2392,6 +2422,13 @@ def main() -> None:
     with c3:
         comparison_new_price_eok = st.number_input("비교 신축 시세(억)", min_value=0.0, value=48.0, step=0.1, help=FIELD_HELP["comparison_new_price"])
         general_sale_price_eok = st.number_input("일반분양 평균가(억)", min_value=0.0, value=14.0, step=0.1, help=FIELD_HELP["general_sale_price"])
+        general_sale_price_basis_exclusive_area = st.number_input(
+            "일반분양가 기준 전용(㎡)",
+            min_value=20.0,
+            value=84.0,
+            step=1.0,
+            help=FIELD_HELP["general_sale_price_basis_area"],
+        )
     with c4:
         default_households = (
             autofill_project.owner_count
@@ -2454,6 +2491,7 @@ def main() -> None:
             current_unit_supply_area=redevelopment_base_supply_area if project_kind == ProjectKind.REDEVELOPMENT else current_unit_supply_area,
             comparison_new_price=won_from_eok(comparison_new_price_eok) if comparison_new_price_eok else None,
             general_sale_price=won_from_eok(general_sale_price_eok) if general_sale_price_eok else None,
+            general_sale_price_basis_exclusive_area=general_sale_price_basis_exclusive_area or None,
             current_households=int(current_households),
             current_far=current_far or None,
             target_far=target_far or None,
@@ -2697,6 +2735,7 @@ def main() -> None:
         current_unit_supply_area=redevelopment_base_supply_area if project_kind == ProjectKind.REDEVELOPMENT else current_unit_supply_area,
         comparison_new_price=won_from_eok(comparison_new_price_eok) if comparison_new_price_eok else None,
         general_sale_price=won_from_eok(general_sale_price_eok) if general_sale_price_eok else None,
+        general_sale_price_basis_exclusive_area=general_sale_price_basis_exclusive_area or None,
         current_households=int(current_households),
         current_far=current_far or None,
         target_far=target_far or None,
