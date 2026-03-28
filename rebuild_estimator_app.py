@@ -492,6 +492,26 @@ def fmt_money(value: float | None) -> str:
     return f"{float(value) / 100_000_000.0:,.2f}억"
 
 
+def settlement_label(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value > 0:
+        return "추가분담금"
+    if value < 0:
+        return "환급금"
+    return "정산 없음"
+
+
+def fmt_settlement(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value > 0:
+        return f"추가분담금 {fmt_money(value)}"
+    if value < 0:
+        return f"환급금 {fmt_money(abs(value))}"
+    return "정산 없음"
+
+
 def fmt_pct(value: float | None) -> str:
     if value is None:
         return "-"
@@ -895,9 +915,9 @@ def adjustment_factor(
     return (1.25 if capital_area else 1.18), "heuristic_default"
 
 
-def simple_top_drivers(duration_cost: float, construction_cost: float, additional_cash_needed: float) -> list[str]:
+def simple_top_drivers(duration_cost: float, construction_cost: float, settlement_amount: float) -> list[str]:
     items = [
-        ("추가투입금", max(additional_cash_needed, 0.0), "선택 평형과 권리가액 차이"),
+        ("정산액", abs(settlement_amount), "선택 평형과 권리가액 차이"),
         ("본공사비", max(construction_cost, 0.0), "연면적과 평당 공사비"),
         ("시간비용", max(duration_cost, 0.0), "보유비용과 이자"),
     ]
@@ -1746,8 +1766,10 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         key=lambda row: float(row["전용㎡"]),
     )
     upsize_option = upsize_candidates[0] if upsize_candidates else None
-    quick_additional_cash = max(average_member_sale_price - rights_value, 0.0)
-    selected_additional_cash = max(float(selected["예상 추가분담금"]), 0.0) if selected else quick_additional_cash
+    quick_settlement_amount = average_member_sale_price - rights_value
+    selected_settlement_amount = float(selected["예상 추가분담금"]) if selected else quick_settlement_amount
+    selected_settlement_payment = max(selected_settlement_amount, 0.0)
+    selected_refund_amount = max(-selected_settlement_amount, 0.0)
 
     exits: list[dict[str, float | str | None]] = []
     for exit_name in EXIT_SCENARIOS:
@@ -1764,13 +1786,13 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         gross_exit_value = benchmark_new_price * realization
         acquisition_cost = quick_inputs.purchase_price * advanced_inputs.acquisition_rate
         holding_cost = quick_inputs.purchase_price * advanced_inputs.annual_holding_rate * years
-        capital_interest = max(selected_additional_cash, 0.0) * max(base_pf_rate + 0.01, 0.04) * years * 0.45
+        capital_interest = selected_settlement_payment * max(base_pf_rate + 0.01, 0.04) * years * 0.45
         disposal_cost = gross_exit_value * advanced_inputs.brokerage_rate
-        pretax_profit = gross_exit_value - disposal_cost - (
+        pretax_profit = gross_exit_value - disposal_cost + selected_refund_amount - (
             quick_inputs.purchase_price
             + acquisition_cost
             + holding_cost
-            + max(selected_additional_cash, 0.0)
+            + selected_settlement_payment
             + capital_interest
         )
         after_tax_profit = pretax_profit - max(pretax_profit, 0.0) * advanced_inputs.capital_gains_effective_rate
@@ -1778,14 +1800,15 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             quick_inputs.purchase_price
             + acquisition_cost
             + holding_cost
-            + max(selected_additional_cash, 0.0)
+            + selected_settlement_payment
             + capital_interest
         )
         roi = safe_div(after_tax_profit, total_outflow, 0.0)
-        net_exit_inflow = gross_exit_value - disposal_cost - max(pretax_profit, 0.0) * advanced_inputs.capital_gains_effective_rate
+        net_exit_inflow = gross_exit_value - disposal_cost + selected_refund_amount - max(pretax_profit, 0.0) * advanced_inputs.capital_gains_effective_rate
         irr = (net_exit_inflow / total_outflow) ** (1.0 / years) - 1.0 if total_outflow > 0 and net_exit_inflow > 0 else None
         break_even_purchase = max(
-            (gross_exit_value - disposal_cost - holding_cost - max(selected_additional_cash, 0.0) - capital_interest) / max(1.0 + advanced_inputs.acquisition_rate, 0.01),
+            (gross_exit_value - disposal_cost - holding_cost + selected_refund_amount - selected_settlement_payment - capital_interest)
+            / max(1.0 + advanced_inputs.acquisition_rate, 0.01),
             0.0,
         )
         exits.append(
@@ -1812,7 +1835,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         "총수입": total_revenue,
         "총지출": total_cost,
         "추정비례율": proportional_ratio,
-        "세대당 평균 추가분담금": max(average_member_sale_price - rights_value, 0.0),
+        "세대당 평균 정산액": average_member_sale_price - rights_value,
         "예상 총세대수": float(simulation.planned_households),
         "엔진 추정 총세대수": float(simulation.simulated_total_households),
         "일반분양 비율": general_sale_ratio,
@@ -1867,15 +1890,15 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             sensitivity_rows.append({"판매율": f"{sale_rate * 100:.0f}%", "공사비 배수": f"{cost_multiplier:.2f}x", "비례율": f"{variant_ratio:.2f}%"})
 
     land_share_est = safe_div(simulation.site_area_sqm or 0.0, quick_inputs.current_households, 0.0) if simulation.site_area_sqm else 0.0
-    top_drivers = simple_top_drivers(time_cost_to_exit, direct_construction_cost, selected_additional_cash)
+    top_drivers = simple_top_drivers(time_cost_to_exit, direct_construction_cost, selected_settlement_amount)
     cost_note = "재개발 세입자 보상비를 포함했습니다." if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT else "재건축은 주거이전비·영업손실보상비를 기본 제외했습니다."
     if selected:
-        first_line = f"현재 입력 기준 추천 평형은 {selected['평형']}이고 예상 추가분담금은 {fmt_money(selected_additional_cash)}입니다."
+        first_line = f"현재 입력 기준 추천 평형은 {selected['평형']}이고 예상 정산액은 {fmt_settlement(selected_settlement_amount)}입니다."
     else:
-        first_line = f"현재 입력 기준 세대당 평균 추가분담금은 {fmt_money(quick_additional_cash)}입니다."
+        first_line = f"현재 입력 기준 세대당 평균 정산액은 {fmt_settlement(quick_settlement_amount)}입니다."
     if upsize_option is not None:
         upsize_delta = float(upsize_option["전용㎡"]) - quick_inputs.current_unit_exclusive_area
-        second_line = f"한 단계 넓힌 {upsize_option['평형']} 기준 추가분담금은 {fmt_money(max(float(upsize_option['예상 추가분담금']), 0.0))}로, 현재보다 전용 {upsize_delta:.1f}㎡ 넓어지는 가정입니다."
+        second_line = f"한 단계 넓힌 {upsize_option['평형']} 기준 정산액은 {fmt_settlement(float(upsize_option['예상 추가분담금']))}이고, 현재보다 전용 {upsize_delta:.1f}㎡ 넓어지는 가정입니다."
     else:
         second_line = f"준공 직후 매도 기준 세후순이익은 {fmt_money(float(selected_exit['세후 순이익']))}입니다. ROI는 {fmt_pct(float(selected_exit['ROI']))}로 참고만 보세요."
     summary_lines = [
@@ -1910,7 +1933,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         scenario_name=scenario_name,
         remaining_months=remaining_months,
         current_unit_exclusive_area=quick_inputs.current_unit_exclusive_area,
-        additional_cash_needed=selected_additional_cash,
+        additional_cash_needed=selected_settlement_amount,
         time_cost_to_exit=time_cost_to_exit,
         selected_exit_name="준공 직후 매도",
         selected_exit=selected_exit,
@@ -2103,7 +2126,7 @@ def project_summary_rows(result: QuickResult) -> list[dict[str, str]]:
         {"항목": "총수입", "값": fmt_money(result.project_summary["총수입"])},
         {"항목": "총지출", "값": fmt_money(result.project_summary["총지출"])},
         {"항목": "추정비례율", "값": fmt_plain_pct(result.project_summary["추정비례율"])},
-        {"항목": "세대당 평균 추가분담금", "값": fmt_money(result.project_summary["세대당 평균 추가분담금"])},
+        {"항목": "세대당 평균 정산액", "값": fmt_settlement(result.project_summary["세대당 평균 정산액"])},
         {"항목": "예상 총세대수", "값": f"{int(result.project_summary['예상 총세대수']):,}세대"},
         {"항목": "엔진 추정 총세대수", "값": f"{int(result.project_summary['엔진 추정 총세대수']):,}세대"},
         {"항목": "일반분양 비율", "값": fmt_pct(result.project_summary["일반분양 비율"])},
@@ -2140,7 +2163,7 @@ def allocation_rows(result: QuickResult) -> list[dict[str, str]]:
                 "평형": str(row["평형"]),
                 "전용㎡": f"{float(row['전용㎡']):,.1f}",
                 "현재 대비": "동급" if abs(area_delta) < 0.1 else f"{area_delta:+.1f}㎡",
-                "예상 추가분담금": fmt_money(float(row["예상 추가분담금"])),
+                "예상 정산액": fmt_settlement(float(row["예상 추가분담금"])),
                 "커버율": fmt_pct(float(row["커버율"])),
                 "판정": str(row["판정"]),
             }
@@ -2184,11 +2207,11 @@ def scenario_overview_rows(results: list[QuickResult]) -> list[dict[str, str]]:
     for result in results:
         upsize_text = "-"
         if result.upsize_allocation is not None:
-            upsize_text = fmt_money(max(float(result.upsize_allocation["예상 추가분담금"]), 0.0))
+            upsize_text = fmt_settlement(float(result.upsize_allocation["예상 추가분담금"]))
         rows.append(
             {
                 "시나리오": result.scenario_name,
-                "추천 평형 추가분담금": fmt_money(result.additional_cash_needed),
+                "추천 평형 정산액": fmt_settlement(result.additional_cash_needed),
                 "한 단계 확장": upsize_text,
                 "손익분기 매수가": fmt_money(result.break_even_purchase_price),
                 "일반분양 세대수": f"{result.simulation_result.general_sale_households:,}세대",
@@ -2225,11 +2248,11 @@ def render_result_summary(result: QuickResult) -> None:
     upsize_value = "-"
     upsize_sub = "확장 평형 없음"
     if result.upsize_allocation is not None:
-        upsize_value = fmt_money(max(float(result.upsize_allocation["예상 추가분담금"]), 0.0))
+        upsize_value = fmt_settlement(float(result.upsize_allocation["예상 추가분담금"]))
         area_delta = float(result.upsize_allocation["전용㎡"]) - result.current_unit_exclusive_area
         upsize_sub = f"{result.upsize_allocation['평형']} / +{area_delta:.1f}㎡"
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("추천 평형 추가분담금", fmt_money(result.additional_cash_needed), f"{recommended_label} / {recommended_sub}")
+    c1.metric("추천 평형 정산액", fmt_settlement(result.additional_cash_needed), f"{recommended_label} / {recommended_sub}")
     c2.metric("한 단계 넓히면", upsize_value, upsize_sub)
     c3.metric("손익분기 매수가", fmt_money(result.break_even_purchase_price), "세후 0원 기준")
     c4.metric("예상 시간비용", fmt_money(result.time_cost_to_exit), "보유비용 + 자금이자")
@@ -2250,7 +2273,7 @@ def render_input_guide(project_kind: ProjectKind) -> None:
     st.markdown(
         "<div class='section-card'>"
         "<div class='soft-title'>입력 가이드</div>"
-        "<p class='mini-note'>이 계산기는 ROI보다 평형별 추가분담금과 손익분기 매수가를 먼저 보여주도록 설계했습니다. ROI는 하단 시나리오 표에서 보조지표로만 확인하세요.</p>"
+        "<p class='mini-note'>이 계산기는 ROI보다 평형별 정산액(추가분담 또는 환급)과 손익분기 매수가를 먼저 보여주도록 설계했습니다. ROI는 하단 시나리오 표에서 보조지표로만 확인하세요.</p>"
         "<p class='mini-note'>일반분양 평균가는 준공 또는 분양 시점 기준의 예상 일반분양 평균가입니다. 현재 주변 실거래가와 같은 의미가 아닙니다.</p>"
         "<p class='mini-note'>목표 용적률과 목표 건폐율을 같이 넣으면 총세대수와 평균층수를 자동 점검합니다. 목표 건폐율이 없으면 세대수 과다 경고는 약해집니다.</p>"
         "<p class='mini-note'>기부채납 비율은 도로·공원·공공시설로 빠지는 면적을 묶어 반영한 간편값이며, 공식 토지이용계획이 있으면 그 값이 우선합니다.</p>"
@@ -2750,11 +2773,11 @@ def main() -> None:
         with left:
             if focus_result.allocation_options:
                 if not detail_allowed:
-                    st.caption("관리처분 이전 단계에서는 권리가액과 분양가표가 개략치이므로, 아래 추가분담금은 빠른 검토용 시뮬레이션으로 보세요.")
-                render_table(allocation_rows(focus_result), "평형별 추가분담 시뮬레이션")
+                    st.caption("관리처분 이전 단계에서는 권리가액과 분양가표가 개략치이므로, 아래 정산액은 빠른 검토용 시뮬레이션으로 보세요.")
+                render_table(allocation_rows(focus_result), "평형별 정산액 시뮬레이션")
             else:
                 st.markdown(
-                    "<div class='section-card'><div class='soft-title'>평형별 추가분담 시뮬레이션</div><p class='mini-note'>현재 입력값으로는 평형별 추가분담 시뮬레이션을 만들기 어려웠습니다. 일반분양 평균가나 예상 새 전용면적을 한 번 더 확인해 주세요.</p></div>",
+                    "<div class='section-card'><div class='soft-title'>평형별 정산액 시뮬레이션</div><p class='mini-note'>현재 입력값으로는 평형별 정산액 시뮬레이션을 만들기 어려웠습니다. 일반분양 평균가나 예상 새 전용면적을 한 번 더 확인해 주세요.</p></div>",
                     unsafe_allow_html=True,
                 )
         with right:
