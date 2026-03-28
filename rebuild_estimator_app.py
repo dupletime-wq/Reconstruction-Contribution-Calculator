@@ -754,11 +754,11 @@ def estimate_current_gross_floor_area_sqm(quick_inputs: QuickDealInputs, advance
     if advanced_inputs.unit_mix_rows and uses_apartment_reconstruction_flow(quick_inputs):
         return sum(item.households * item.supply_area_sqm for item in advanced_inputs.unit_mix_rows) * 1.08
     if uses_land_based_flow(quick_inputs):
+        if quick_inputs.site_area_sqm and quick_inputs.current_far:
+            return quick_inputs.site_area_sqm * (quick_inputs.current_far / 100.0)
         if quick_inputs.land_share and quick_inputs.current_households and quick_inputs.current_far:
             site_area_sqm = quick_inputs.land_share * quick_inputs.current_households
             return site_area_sqm * (quick_inputs.current_far / 100.0)
-        if quick_inputs.site_area_sqm and quick_inputs.current_far:
-            return quick_inputs.site_area_sqm * (quick_inputs.current_far / 100.0)
     return quick_inputs.current_households * quick_inputs.current_unit_supply_area * 1.08
 
 
@@ -1636,10 +1636,10 @@ def default_move_loan_duration_months(remaining_months: float) -> float:
 
 
 def estimate_site_area(inputs: QuickDealInputs, current_gross_floor_area_sqm: float) -> tuple[float | None, str]:
-    if inputs.land_share:
-        return inputs.land_share * inputs.current_households, "manual"
     if inputs.site_area_sqm:
         return inputs.site_area_sqm, "official_cleanup" if inputs.lookup_enabled else "manual"
+    if inputs.land_share:
+        return inputs.land_share * inputs.current_households, "manual"
     if inputs.current_far:
         return current_gross_floor_area_sqm / max(inputs.current_far / 100.0, 0.01), "simulation"
     if inputs.current_building_coverage_ratio and inputs.average_current_floors:
