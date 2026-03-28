@@ -122,6 +122,8 @@ DISPLAY_KEY_LABELS: dict[str, str] = {
     "adjustment_factor": "보정계수",
     "planned_households": "예상 총세대수",
     "general_sale_ratio": "일반분양 비율",
+    "member_sale_price_ratio": "조합원 분양가 비율",
+    "rental_revenue": "임대주택수입",
     "site_area_sqm": "대지면적",
     "target_far": "목표 용적률",
     "building_coverage_ratio": "목표 건폐율",
@@ -185,6 +187,7 @@ FIELD_HELP: dict[str, str] = {
     "comparison_new_price": "준공 후 이 매물이 따라갈 가능성이 있는 신축 시세입니다. 현재 매물가가 아니라 출구가격 앵커입니다.",
     "general_sale_price": "준공 또는 분양 시점 기준의 예상 일반분양 평균가입니다. 현재 주변 실거래가와 같은 뜻이 아닙니다.",
     "general_sale_price_basis_area": "입력한 일반분양 평균가가 어느 전용면적 기준인지 적는 값입니다. 예를 들어 84㎡ 기준 14억이면 84를 넣어야 다른 평형으로 합리적으로 환산할 수 있습니다.",
+    "general_sale_price_per_pyeong": "블로그나 사업성 분석 글처럼 공급면적 기준 평당 분양가로 계산하고 싶을 때 쓰는 값입니다. 이 값을 넣으면 일반분양 총액 입력보다 우선해서 사용합니다.",
     "current_households": "재건축은 기존 세대수, 재개발은 토지등소유자 수 또는 분양대상 권리자 수에 가깝게 입력할수록 정확합니다.",
     "current_far": "현재 구역의 현황 용적률입니다. 대지지분이나 공식 대지면적이 없을 때 대지면적 역산에 사용합니다.",
     "target_far": "정비계획 또는 예상 정비계획 기준 목표 용적률입니다. 총세대수 시뮬레이션의 핵심 값입니다.",
@@ -201,6 +204,8 @@ FIELD_HELP: dict[str, str] = {
     "cash_settlement_rate": "현금청산, 분양제외 등으로 조합원 분양분에서 빠질 비율입니다.",
     "pf_rate": "사업비 조달에 반영할 PF 금리입니다.",
     "move_loan_rate": "이주비 이자율 또는 추가자금 조달금리의 근사치입니다.",
+    "member_sale_price_ratio": "조합원 분양가를 일반분양가 대비 몇 %로 볼지 정하는 값입니다. 문서 분양가표가 없을 때 빠른 정밀도를 높이는 보정값으로 쓰면 좋습니다.",
+    "rental_sale_price_per_pyeong": "임대주택 수입을 공급평당 얼마로 볼지 정하는 값입니다. 블로그 사례나 서울시 추정 흐름에서는 1,000만원/평 수준을 자주 사용합니다.",
     "pf_financing_ratio": "총 사업비 중 PF 등 차입으로 조달한다고 보는 비율입니다. 실제 조달계획이 있으면 그 비율을 우선 넣으세요.",
     "pf_interest_months": "PF 이자가 실제로 붙는 기간입니다. 공사 전후 전 기간이 아니라 차입이 발생하는 구간만 반영하는 게 맞습니다.",
     "avg_move_loan_amount": "서울시 매뉴얼 기준 조합원이주비 이자 추산은 `조합원 수 × 세대당 평균 무이자 이주비 × 연이자율 × 대여기간`입니다. 세대당 평균 무이자 이주비를 넣으세요.",
@@ -332,6 +337,7 @@ class QuickDealInputs:
     comparison_new_price: float | None
     general_sale_price: float | None
     general_sale_price_basis_exclusive_area: float | None
+    general_sale_price_per_pyeong_manwon: float | None
     current_households: int
     current_far: float | None
     target_far: float | None
@@ -366,6 +372,8 @@ class QuickDealInputs:
 class AdvancedProjectInputs:
     rights_inputs: RightsInputs
     unit_mix_rows: list[UnitMixRow]
+    member_sale_price_ratio_override: float | None
+    rental_sale_price_per_pyeong_manwon: float | None
     pf_financing_ratio: float
     pf_interest_months: float
     average_move_loan_amount: float
@@ -528,6 +536,64 @@ def scale_price_by_area(anchor_price: float, anchor_exclusive_area: float | None
     return float(anchor_price) * ((target_area / base_area) ** 0.98)
 
 
+def price_from_supply_pyeong(price_per_pyeong_manwon: float | None, target_supply_area_sqm: float | None) -> float | None:
+    if price_per_pyeong_manwon is None or target_supply_area_sqm is None:
+        return None
+    return float(price_per_pyeong_manwon) * 10_000.0 * (float(target_supply_area_sqm) / 3.3058)
+
+
+def resolve_market_unit_price(
+    *,
+    general_sale_price: float | None,
+    general_sale_price_basis_exclusive_area: float | None,
+    general_sale_price_per_pyeong_manwon: float | None,
+    comparison_new_price: float | None,
+    comparison_anchor_exclusive_area: float | None,
+    purchase_price: float,
+    target_exclusive_area: float | None,
+    target_supply_area_sqm: float | None,
+) -> float:
+    if general_sale_price_per_pyeong_manwon is not None and target_supply_area_sqm is not None:
+        per_pyeong_price = price_from_supply_pyeong(general_sale_price_per_pyeong_manwon, target_supply_area_sqm)
+        if per_pyeong_price is not None:
+            return per_pyeong_price
+    if general_sale_price:
+        return scale_price_by_area(general_sale_price, general_sale_price_basis_exclusive_area or 84.0, target_exclusive_area)
+    if comparison_new_price:
+        return scale_price_by_area(comparison_new_price, comparison_anchor_exclusive_area or target_exclusive_area, target_exclusive_area)
+    fallback_anchor = comparison_anchor_exclusive_area or target_exclusive_area or 84.0
+    return scale_price_by_area(purchase_price * 1.45, fallback_anchor, target_exclusive_area)
+
+
+def default_member_sale_price_ratio(
+    quick_inputs: "QuickDealInputs",
+    current_stage: str,
+    override_value: float | None,
+) -> tuple[float, str]:
+    if override_value is not None:
+        return clamp(override_value, 0.55, 0.95), "manual_override"
+    if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT:
+        base_ratio = 0.70
+    elif quick_inputs.reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER:
+        base_ratio = 0.72
+    else:
+        base_ratio = 0.75
+    if quick_inputs.capital_area and quick_inputs.project_kind == ProjectKind.RECONSTRUCTION:
+        base_ratio -= 0.02
+    if current_stage in {"관리처분인가", "이주/철거", "착공", "준공/입주"}:
+        base_ratio += 0.02
+    return clamp(base_ratio, 0.60, 0.90), "preset"
+
+
+def default_rental_sale_price_per_pyeong_manwon(
+    quick_inputs: "QuickDealInputs",
+    override_value: float | None,
+) -> tuple[float, str]:
+    if override_value is not None:
+        return max(float(override_value), 0.0), "manual_override"
+    return (1000.0 if quick_inputs.capital_area else 800.0), "preset"
+
+
 def fmt_pct(value: float | None) -> str:
     if value is None:
         return "-"
@@ -620,6 +686,14 @@ def parse_member_price_text(raw_text: str) -> list[MemberPriceRecord]:
     return records
 
 
+def weighted_average_exclusive_area(unit_mix_rows: list[UnitMixRow], default_exclusive_area: float) -> float:
+    if not unit_mix_rows:
+        return default_exclusive_area
+    weighted_area = sum(item.households * item.exclusive_area_sqm for item in unit_mix_rows)
+    total_households = sum(item.households for item in unit_mix_rows)
+    return safe_div(weighted_area, total_households, default_exclusive_area)
+
+
 def default_member_price_table(
     user_text: str,
     doc_table: list[MemberPriceRecord],
@@ -629,9 +703,11 @@ def default_member_price_table(
     comparison_new_price: float | None,
     general_sale_price: float | None,
     general_sale_price_basis_exclusive_area: float | None,
+    general_sale_price_per_pyeong_manwon: float | None,
     purchase_price: float,
     current_exclusive_area: float,
     expected_new_area: float | None,
+    member_sale_price_ratio: float,
 ) -> list[MemberPriceRecord]:
     text_table = parse_member_price_text(user_text)
     if text_table:
@@ -645,13 +721,18 @@ def default_member_price_table(
         sizes = sorted({59.0, 84.0, 101.0, round(base_exclusive)})
     rows: list[MemberPriceRecord] = []
     for size in sizes:
-        if general_sale_price:
-            market_price = scale_price_by_area(general_sale_price, general_sale_price_basis_exclusive_area or 84.0, size)
-        elif comparison_new_price:
-            market_price = scale_price_by_area(comparison_new_price, base_exclusive, size)
-        else:
-            market_price = scale_price_by_area(purchase_price * 1.45, base_exclusive, size)
-        member_price = market_price * 0.85
+        supply_area = round(size / 0.78, 2)
+        market_price = resolve_market_unit_price(
+            general_sale_price=general_sale_price,
+            general_sale_price_basis_exclusive_area=general_sale_price_basis_exclusive_area,
+            general_sale_price_per_pyeong_manwon=general_sale_price_per_pyeong_manwon,
+            comparison_new_price=comparison_new_price,
+            comparison_anchor_exclusive_area=base_exclusive,
+            purchase_price=purchase_price,
+            target_exclusive_area=size,
+            target_supply_area_sqm=supply_area,
+        )
+        member_price = market_price * member_sale_price_ratio
         rows.append(MemberPriceRecord(label=f"{int(size)}형", exclusive_area_sqm=float(size), supply_area_sqm=round(size / 0.78, 2), member_sale_price=member_price))
     return rows
 
@@ -905,6 +986,7 @@ def simulate_project_plan(
 def build_feasibility_checks(
     quick_inputs: QuickDealInputs,
     simulation: SimulationResult,
+    has_unit_mix: bool = False,
 ) -> list[FeasibilityCheck]:
     checks: list[FeasibilityCheck] = []
     if simulation.required_avg_floors is not None:
@@ -942,6 +1024,7 @@ def build_feasibility_checks(
 def build_feasibility_checks(
     quick_inputs: QuickDealInputs,
     simulation: SimulationResult,
+    has_unit_mix: bool = False,
 ) -> list[FeasibilityCheck]:
     checks: list[FeasibilityCheck] = []
     if simulation.required_avg_floors is not None:
@@ -978,6 +1061,14 @@ def build_feasibility_checks(
         checks.append(FeasibilityCheck("note", "보상비 처리", "단독주택 묶음형 재건축은 재개발처럼 세입자 보상비를 자동 가산하지 않고, 재건축 비용 구조를 유지합니다."))
     else:
         checks.append(FeasibilityCheck("note", "재건축 비용 구조", "아파트형 재건축은 주거이전비·영업손실보상비를 기본 자동 반영하지 않습니다."))
+        if quick_inputs.current_households >= 300 and not has_unit_mix:
+            checks.append(
+                FeasibilityCheck(
+                    "warn",
+                    "평형 분포 누락",
+                    "대단지 재건축인데 기존 평형 분포 입력이 없어 조합원분양수입을 단일 평형 기준으로 추정했습니다. 대형 평형 비중이 큰 단지는 기존 타입 분포를 넣어야 오차가 줄어듭니다.",
+                )
+            )
     return checks
 
 
@@ -1747,6 +1838,11 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         total_old_asset_value = old_asset_estimate * member_count
         total_old_asset_source = "scaled_individual_old_asset"
 
+    member_sale_price_ratio, member_sale_price_ratio_source = default_member_sale_price_ratio(
+        quick_inputs,
+        quick_inputs.current_stage,
+        advanced_inputs.member_sale_price_ratio_override,
+    )
     price_table = default_member_price_table(
         user_text=rights_inputs.member_price_text,
         doc_table=parsed_notice.member_price_table if parsed_notice else [],
@@ -1756,9 +1852,11 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         comparison_new_price=quick_inputs.comparison_new_price,
         general_sale_price=quick_inputs.general_sale_price,
         general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
+        general_sale_price_per_pyeong_manwon=quick_inputs.general_sale_price_per_pyeong_manwon,
         purchase_price=quick_inputs.purchase_price,
         current_exclusive_area=quick_inputs.current_unit_exclusive_area,
         expected_new_area=rights_inputs.expected_new_exclusive_area,
+        member_sale_price_ratio=member_sale_price_ratio,
     )
 
     general_sale_households = simulation.general_sale_households
@@ -1779,20 +1877,61 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     if quick_inputs.project_kind == ProjectKind.RECONSTRUCTION and quick_inputs.current_stage == "재건축진단":
         union_and_professional_cost += max(member_count * 250_000.0, 80_000_000.0)
 
-    average_member_sale_price = statistics.mean(item.member_sale_price for item in price_table)
-    benchmark_new_price = quick_inputs.comparison_new_price or quick_inputs.general_sale_price or average_member_sale_price / 0.85
-    member_sale_revenue = member_count * average_member_sale_price
+    average_member_exclusive_area = weighted_average_exclusive_area(
+        advanced_inputs.unit_mix_rows,
+        rights_inputs.expected_new_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0,
+    )
+    average_member_supply_area = weighted_average_supply_area(
+        advanced_inputs.unit_mix_rows,
+        max(
+            quick_inputs.current_unit_supply_area or 0.0,
+            (rights_inputs.expected_new_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0) / 0.78,
+        ),
+    )
     general_sale_reference_exclusive_area = max(simulation.average_supply_area_sqm * 0.78, 1.0)
-    if quick_inputs.general_sale_price:
-        general_sale_unit_price = scale_price_by_area(
-            quick_inputs.general_sale_price,
-            quick_inputs.general_sale_price_basis_exclusive_area or 84.0,
-            general_sale_reference_exclusive_area,
-        )
-    else:
-        benchmark_anchor_area = rights_inputs.expected_new_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0
-        general_sale_unit_price = scale_price_by_area(benchmark_new_price, benchmark_anchor_area, general_sale_reference_exclusive_area)
+    general_sale_reference_supply_area = max(simulation.average_supply_area_sqm, average_member_supply_area, 1.0)
+    benchmark_anchor_area = rights_inputs.expected_new_exclusive_area or average_member_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0
+    benchmark_new_price = resolve_market_unit_price(
+        general_sale_price=quick_inputs.general_sale_price,
+        general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
+        general_sale_price_per_pyeong_manwon=quick_inputs.general_sale_price_per_pyeong_manwon,
+        comparison_new_price=quick_inputs.comparison_new_price,
+        comparison_anchor_exclusive_area=benchmark_anchor_area,
+        purchase_price=quick_inputs.purchase_price,
+        target_exclusive_area=benchmark_anchor_area,
+        target_supply_area_sqm=average_member_supply_area,
+    )
+    general_sale_unit_price = resolve_market_unit_price(
+        general_sale_price=quick_inputs.general_sale_price,
+        general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
+        general_sale_price_per_pyeong_manwon=quick_inputs.general_sale_price_per_pyeong_manwon,
+        comparison_new_price=quick_inputs.comparison_new_price,
+        comparison_anchor_exclusive_area=benchmark_anchor_area,
+        purchase_price=quick_inputs.purchase_price,
+        target_exclusive_area=general_sale_reference_exclusive_area,
+        target_supply_area_sqm=general_sale_reference_supply_area,
+    )
+    average_member_sale_price = resolve_market_unit_price(
+        general_sale_price=quick_inputs.general_sale_price,
+        general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
+        general_sale_price_per_pyeong_manwon=quick_inputs.general_sale_price_per_pyeong_manwon,
+        comparison_new_price=quick_inputs.comparison_new_price,
+        comparison_anchor_exclusive_area=benchmark_anchor_area,
+        purchase_price=quick_inputs.purchase_price,
+        target_exclusive_area=average_member_exclusive_area,
+        target_supply_area_sqm=average_member_supply_area,
+    ) * member_sale_price_ratio
+    if rights_inputs.member_price_text.strip() or (quick_inputs.use_doc_price_table and parsed_notice and parsed_notice.member_price_table):
+        average_member_sale_price = statistics.mean(item.member_sale_price for item in price_table)
+    member_sale_revenue = member_count * average_member_sale_price
     general_sale_revenue = general_sale_households * general_sale_unit_price * base_sale_rate
+    rental_sale_price_per_pyeong_manwon, rental_price_source = default_rental_sale_price_per_pyeong_manwon(
+        quick_inputs,
+        advanced_inputs.rental_sale_price_per_pyeong_manwon,
+    )
+    rental_supply_area_sqm = clamp(simulation.average_supply_area_sqm * 0.80, 75.0, 95.0)
+    rental_unit_price = price_from_supply_pyeong(rental_sale_price_per_pyeong_manwon, rental_supply_area_sqm) or 0.0
+    rental_revenue = rental_households * rental_unit_price
     ancillary_revenue = advanced_inputs.ancillary_revenue or direct_construction_cost * 0.02
     other_disposal_revenue = advanced_inputs.other_disposal_revenue or direct_construction_cost * 0.01
 
@@ -1855,7 +1994,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     }
     buckets = build_cost_buckets(base_bucket_amounts, advanced_inputs.cost_bucket_overrides, parsed_notice.document_cost_breakdown if parsed_notice else {})
     total_cost = sum(bucket.amount for bucket in buckets)
-    total_revenue = member_sale_revenue + general_sale_revenue + ancillary_revenue + other_disposal_revenue
+    total_revenue = member_sale_revenue + general_sale_revenue + rental_revenue + ancillary_revenue + other_disposal_revenue
 
     if parsed_notice and "total_revenue" in quick_inputs.applied_document_fields and "total_revenue" in parsed_notice.revenue_items:
         total_revenue = parsed_notice.revenue_items["total_revenue"]
@@ -1976,6 +2115,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         "총지출": total_cost,
         "추정비례율": display_proportional_ratio,
         "세대당 평균 정산액": average_member_sale_price - rights_value if settlement_ready else None,
+        "임대주택수입": rental_revenue,
         "예상 총세대수": float(simulation.planned_households),
         "엔진 추정 총세대수": float(simulation.simulated_total_households),
         "일반분양 비율": general_sale_ratio,
@@ -1994,7 +2134,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
                 quick_inputs.current_far is not None,
                 quick_inputs.target_far is not None,
                 quick_inputs.target_building_coverage_ratio is not None,
-                bool(quick_inputs.general_sale_price or quick_inputs.comparison_new_price),
+                bool(quick_inputs.general_sale_price or quick_inputs.general_sale_price_per_pyeong_manwon or quick_inputs.comparison_new_price),
                 simulation.site_area_sqm is not None,
             ]
         )
@@ -2024,7 +2164,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     for sale_rate in (0.92, 0.95, 0.97, 1.00):
         for cost_multiplier in (0.95, 1.00, 1.05, 1.10):
             variant_sale_revenue = general_sale_households * general_sale_unit_price * sale_rate
-            variant_total_revenue = member_sale_revenue + variant_sale_revenue + ancillary_revenue + other_disposal_revenue
+            variant_total_revenue = member_sale_revenue + variant_sale_revenue + rental_revenue + ancillary_revenue + other_disposal_revenue
             variant_total_cost = total_cost - direct_construction_cost + direct_construction_cost * cost_multiplier
             variant_ratio = safe_div(variant_total_revenue - variant_total_cost, total_old_asset_value, 0.0) * 100.0
             sensitivity_rows.append({"판매율": f"{sale_rate * 100:.0f}%", "공사비 배수": f"{cost_multiplier:.2f}x", "비례율": f"{variant_ratio:.2f}%"})
@@ -2057,6 +2197,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         f"손익분기 매수가는 {fmt_money(break_even_purchase_price)}, 권장 최대 매수가는 {fmt_money(max_bid_price)}입니다.",
         f"대지지분은 세대당 약 {land_share_est:,.2f}㎡로 추정했고 출처는 {humanize_source(simulation.site_source)}입니다. {cost_note}",
         f"금융비는 PF 조달비율 {fmt_pct(pf_financing_ratio)}, PF 이자 {pf_interest_months:.0f}개월, 세대당 평균 이주비 {fmt_money(average_move_loan_amount)}, 이주비 대여 {move_loan_duration_months:.0f}개월 가정입니다.",
+        f"조합원 분양가는 일반분양 대비 {fmt_pct(member_sale_price_ratio)}를 기본 가정으로 두고, 임대주택 수입은 평당 {rental_sale_price_per_pyeong_manwon:,.0f}만원 기준으로 반영했습니다.",
         f"가장 영향이 큰 요인은 {', '.join(top_drivers)}입니다.",
     ]
 
@@ -2080,6 +2221,8 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             record("total_revenue", f"{total_revenue:,.0f}", "engine", 0.70),
             record("total_cost", f"{total_cost:,.0f}", "engine", 0.70),
             record("proportional_ratio", "-" if display_proportional_ratio is None else f"{display_proportional_ratio:.2f}", "engine", 0.70),
+            record("member_sale_price_ratio", f"{member_sale_price_ratio * 100:.1f}%", member_sale_price_ratio_source, 0.66),
+            record("rental_revenue", f"{rental_revenue:,.0f}", rental_price_source, 0.64),
             record("planned_households", str(simulation.planned_households), simulation.sources["households"], 0.70),
             record("general_sale_ratio", f"{general_sale_ratio * 100:.2f}%", simulation.sources["general_sale_ratio"], 0.68),
             record("pf_financing_ratio", f"{pf_financing_ratio * 100:.1f}%", "manual", 0.64),
@@ -2113,12 +2256,14 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             "pf_interest_months": pf_interest_months,
             "average_move_loan_amount": average_move_loan_amount,
             "move_loan_duration_months": move_loan_duration_months,
+            "member_sale_price_ratio": member_sale_price_ratio,
+            "rental_sale_price_per_pyeong_manwon": rental_sale_price_per_pyeong_manwon,
         },
         summary_lines=summary_lines,
         source_records=records,
         sensitivity_rows=sensitivity_rows,
         simulation_result=simulation,
-        feasibility_checks=build_feasibility_checks(quick_inputs, simulation),
+        feasibility_checks=build_feasibility_checks(quick_inputs, simulation, bool(advanced_inputs.unit_mix_rows)),
         max_bid_price=max_bid_price,
         break_even_purchase_price=break_even_purchase_price,
         selected_allocation=selected,
@@ -2636,6 +2781,34 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            general_sale_price_per_pyeong_manwon = st.number_input(
+                "일반분양 평당가(만원/평, 선택)",
+                min_value=0.0,
+                value=0.0,
+                step=100.0,
+                help=FIELD_HELP["general_sale_price_per_pyeong"],
+            )
+        with r2:
+            member_sale_price_ratio_pct = st.number_input(
+                "조합원 분양가 비율(%, 선택)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=1.0,
+                help=FIELD_HELP["member_sale_price_ratio"],
+            )
+        with r3:
+            rental_sale_price_per_pyeong_manwon = st.number_input(
+                "임대주택 평당가(만원/평, 선택)",
+                min_value=0.0,
+                value=0.0,
+                step=100.0,
+                help=FIELD_HELP["rental_sale_price_per_pyeong"],
+            )
+        st.caption("평당가를 넣으면 블로그식 사업성 분석처럼 공급면적 기준으로 수익을 계산합니다. 일반분양 총액보다 우선해서 사용합니다.")
+
         preview_quick_inputs = QuickDealInputs(
             project_kind=project_kind,
             reconstruction_style=reconstruction_style,
@@ -2647,6 +2820,7 @@ def main() -> None:
             comparison_new_price=won_from_eok(comparison_new_price_eok) if comparison_new_price_eok else None,
             general_sale_price=won_from_eok(general_sale_price_eok) if general_sale_price_eok else None,
             general_sale_price_basis_exclusive_area=general_sale_price_basis_exclusive_area or None,
+            general_sale_price_per_pyeong_manwon=general_sale_price_per_pyeong_manwon or None,
             current_households=int(current_households),
             current_far=current_far or None,
             target_far=target_far or None,
@@ -2686,6 +2860,8 @@ def main() -> None:
                 member_price_text="",
             ),
             unit_mix_rows=[],
+            member_sale_price_ratio_override=(member_sale_price_ratio_pct / 100.0) if member_sale_price_ratio_pct else None,
+            rental_sale_price_per_pyeong_manwon=rental_sale_price_per_pyeong_manwon or None,
             pf_financing_ratio=default_pf_financing_ratio(project_kind),
             pf_interest_months=0.0,
             average_move_loan_amount=0.0,
@@ -2901,6 +3077,7 @@ def main() -> None:
         comparison_new_price=won_from_eok(comparison_new_price_eok) if comparison_new_price_eok else None,
         general_sale_price=won_from_eok(general_sale_price_eok) if general_sale_price_eok else None,
         general_sale_price_basis_exclusive_area=general_sale_price_basis_exclusive_area or None,
+        general_sale_price_per_pyeong_manwon=general_sale_price_per_pyeong_manwon or None,
         current_households=int(current_households),
         current_far=current_far or None,
         target_far=target_far or None,
@@ -2940,6 +3117,8 @@ def main() -> None:
             member_price_text=member_price_text,
         ),
         unit_mix_rows=parse_unit_mix_text(unit_mix_text),
+        member_sale_price_ratio_override=(member_sale_price_ratio_pct / 100.0) if member_sale_price_ratio_pct else None,
+        rental_sale_price_per_pyeong_manwon=rental_sale_price_per_pyeong_manwon or None,
         pf_financing_ratio=pf_financing_ratio_pct / 100.0,
         pf_interest_months=pf_interest_months,
         average_move_loan_amount=won_from_eok(average_move_loan_amount_eok),
