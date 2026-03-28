@@ -2060,6 +2060,17 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         f"가장 영향이 큰 요인은 {', '.join(top_drivers)}입니다.",
     ]
 
+    if quick_inputs.land_share:
+        summary_lines[4] = f"입력한 내 대지지분은 {quick_inputs.land_share:,.2f}㎡이고, 구역면적 출처는 {humanize_source(simulation.site_source)}입니다. {cost_note}"
+    elif simulation.site_area_sqm and quick_inputs.current_households:
+        summary_lines[4] = f"구역면적 기준 세대당 평균 부지면적 참고치는 약 {land_share_est:,.2f}㎡이고 출처는 {humanize_source(simulation.site_source)}입니다. 이 값은 내 대지지분과 다를 수 있습니다. {cost_note}"
+    if uses_land_based_flow(quick_inputs) and quick_inputs.land_share and quick_inputs.autofill_project and quick_inputs.autofill_project.site_area_sqm:
+        implied_total_site = quick_inputs.land_share * quick_inputs.current_households
+        official_site = quick_inputs.autofill_project.site_area_sqm
+        ratio = safe_div(implied_total_site, official_site, 0.0)
+        if ratio < 0.6 or ratio > 1.4:
+            summary_lines.insert(2, f"입력한 대지지분 x 권리자 수로 본 총면적은 {implied_total_site:,.0f}㎡인데, 서울 공식 구역면적은 {official_site:,.0f}㎡입니다. 대지지분 단위(㎡/평)와 값 자체를 다시 확인하세요.")
+
     records.extend(
         [
             record("old_asset_estimate", f"{old_asset_estimate:,.0f}", old_asset_source, 0.78),
