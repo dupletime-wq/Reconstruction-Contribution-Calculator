@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from html import escape, unescape
 from html.parser import HTMLParser
 from io import BytesIO, StringIO
@@ -67,6 +68,12 @@ ASSUMPTION_PROFILES: dict[str, dict[str, float]] = {
     },
 }
 
+REDEVELOPMENT_PROFILE_FLOORS = {
+    "공격": 1.06,
+    "기준": 1.00,
+    "보수": 0.94,
+}
+
 STAGE_BASE_MONTHS: dict[str, int] = {
     "재건축진단": 120,
     "정비구역지정": 96,
@@ -113,6 +120,16 @@ DISPLAY_KEY_LABELS: dict[str, str] = {
     "document_schedule": "문서 일정 메모",
     "old_asset_estimate": "종전자산 추정액",
     "adjustment_factor": "보정계수",
+    "planned_households": "예상 총세대수",
+    "general_sale_ratio": "일반분양 비율",
+    "site_area_sqm": "대지면적",
+    "target_far": "목표 용적률",
+    "building_coverage_ratio": "목표 건폐율",
+    "current_households": "권리자/기존 세대수",
+    "public_facility_area_sqm": "공공시설 반영면적",
+    "sale_households": "일반분양 세대수",
+    "rental_households": "임대주택 세대수",
+    "donation_area_sqm": "명시 기부채납 면적",
 }
 
 SOURCE_LABELS: dict[str, str] = {
@@ -134,6 +151,8 @@ SOURCE_LABELS: dict[str, str] = {
     "preset": "기본 프리셋",
     "schedule_board": "서울 향후일정 게시판",
     "bucket_override": "상세 비용 직접입력",
+    "manual_override": "직접 수정",
+    "simulation": "시뮬레이션 엔진",
 }
 
 VALUE_LABELS: dict[str, str] = {
@@ -153,6 +172,39 @@ COST_BUCKET_META: tuple[tuple[str, str, str], ...] = (
     ("sales_and_disposal", "분양/처분비", "일반분양 마케팅, 처분비"),
     ("contingency", "예비비", "불확실성 버퍼"),
 )
+
+FIELD_HELP: dict[str, str] = {
+    "project_kind": "재건축은 기존 공동주택을 다시 짓는 경우, 재개발은 권리자와 세입자 보상까지 함께 고려해야 하는 정비사업입니다.",
+    "purchase_price": "현재 검토 중인 매물의 실제 매수가입니다. 취득세 전 가격 기준으로 넣어도 됩니다.",
+    "current_stage": "현재 사업단계입니다. 남은 사업기간, 금융비, 공사비 인플레이션에 직접 반영됩니다.",
+    "comparison_new_price": "준공 후 이 매물이 따라갈 가능성이 있는 신축 시세입니다. 현재 매물가가 아니라 출구가격 앵커입니다.",
+    "general_sale_price": "준공 또는 분양 시점 기준의 예상 일반분양 평균가입니다. 현재 주변 실거래가와 같은 뜻이 아닙니다.",
+    "current_households": "재건축은 기존 세대수, 재개발은 토지등소유자 수 또는 분양대상 권리자 수에 가깝게 입력할수록 정확합니다.",
+    "current_far": "현재 구역의 현황 용적률입니다. 대지지분이나 공식 대지면적이 없을 때 대지면적 역산에 사용합니다.",
+    "target_far": "정비계획 또는 예상 정비계획 기준 목표 용적률입니다. 총세대수 시뮬레이션의 핵심 값입니다.",
+    "target_bcr": "계획 건폐율입니다. 목표 FAR와 함께 넣으면 필요 평균층수와 과도한 세대계획 여부를 점검할 수 있습니다.",
+    "construction_cost": "평당 공사비입니다. 공사계약 전이면 최근 유사 사업장의 범위를 참고해 입력하고, 모르면 기준 시나리오부터 보세요.",
+    "land_share": "내 물건 기준 대지지분입니다. 알면 가장 우선 사용하고, 모르면 비워두면 자동추정합니다.",
+    "current_bcr": "현황 건폐율입니다. 대지지분과 현황 용적률이 모두 없을 때 기존 평균층수와 함께 대지면적 추정에 사용합니다.",
+    "avg_current_floors": "기존 단지의 평균 층수입니다. 현황 건폐율로 대지면적을 역산할 때만 사용합니다.",
+    "target_households_override": "자동 산출된 예상 총세대수가 마음에 들지 않을 때만 직접 덮어쓰세요.",
+    "general_sale_ratio_override": "일반분양 비율은 기본적으로 자동 산출됩니다. 분양계획이 명확할 때만 직접 수정하는 값을 넣으세요.",
+    "donation_ratio_override": "기부채납 비율은 공공시설, 공원, 도로 등으로 빠지는 면적을 간편 반영한 값입니다. 정비사업 정보몽땅의 토지이용계획·공동이용시설 계획이 있으면 그 값이 우선합니다.",
+    "rental_ratio_override": "임대주택 비율은 재개발에서 중요합니다. 공식 주택공급계획이 있으면 그 값이 우선하고, 없으면 사업유형과 프리셋으로 추정합니다. 도시정비법 시행령 제9조 범위를 참고합니다.",
+    "sale_rate": "일반분양분이 실제로 판매되는 비율입니다. 100% 미만이면 미분양 리스크를 반영합니다.",
+    "cash_settlement_rate": "현금청산, 분양제외 등으로 조합원 분양분에서 빠질 비율입니다.",
+    "pf_rate": "사업비 조달에 반영할 PF 금리입니다.",
+    "move_loan_rate": "이주비 이자율 또는 추가자금 조달금리의 근사치입니다.",
+    "official_price_reconstruction": "재건축 정밀계산에서만 쓰는 참고값입니다. 공동주택 공시가격이나 감정가가 있으면 권리가액 추정 보정에 사용합니다.",
+    "official_price_redevelopment": "재개발 정밀계산에서만 쓰는 참고값입니다. 토지/건물 공시가격 또는 감정가를 넣으면 권리가액 참고 추정에 사용합니다.",
+    "unit_mix": "재건축에서 기존 평형별 세대수와 면적을 넣으면 현재 연면적과 세대구성을 더 정확하게 추정합니다. 형식: 타입,세대수,전용,공급",
+    "member_price_text": "정밀모드에서 배정평형 비교가 필요할 때만 쓰는 참고값입니다. 빠른 수익성 답에는 필수가 아닙니다. 형식: 타입,전용,공급,분양가(억)",
+}
+
+
+class ProjectKind(str, Enum):
+    RECONSTRUCTION = "재건축"
+    REDEVELOPMENT = "재개발"
 
 MONEY_TOKEN_PATTERN = re.compile(
     r"(-?\d[\d,]*(?:\.\d+)?)\s*(jo|eok|cheonman|baekman|manwon|조|억|천만|만원|원)?",
@@ -199,6 +251,7 @@ class AutofillProjectData:
     project_name: str
     district: str
     business_type: str
+    project_kind: ProjectKind | None
     progress_stage: str | None
     representative_lot: str = ""
     project_slug: str = ""
@@ -208,13 +261,17 @@ class AutofillProjectData:
     site_area_sqm: float | None = None
     building_area_sqm: float | None = None
     gross_floor_area_sqm: float | None = None
-    building_coverage_ratio: float | None = None
+    target_building_coverage_ratio: float | None = None
+    current_building_coverage_ratio: float | None = None
     target_far: float | None = None
     current_households: int | None = None
     owner_count: int | None = None
     tenant_count: int | None = None
     planned_households: int | None = None
+    sale_households: int | None = None
     rental_households: int | None = None
+    public_facility_area_sqm: float | None = None
+    donation_area_sqm: float | None = None
     schedule_text: str | None = None
     source_records: list[SourceRecord] = field(default_factory=list)
 
@@ -230,33 +287,53 @@ class CostBucket:
 
 
 @dataclass
+class UnitMixRow:
+    label: str
+    households: int
+    exclusive_area_sqm: float
+    supply_area_sqm: float
+
+
+@dataclass
+class RightsInputs:
+    expected_new_exclusive_area: float | None
+    appraised_old_asset_value: float | None
+    total_old_asset_value: float | None
+    official_price_reference: float | None
+    adjustment_factor_override: float | None
+    member_price_text: str
+
+
+@dataclass
 class QuickDealInputs:
+    project_kind: ProjectKind
     scenario_profile: str
     current_stage: str
     purchase_price: float
     current_unit_exclusive_area: float
     current_unit_supply_area: float
-    floor_no: int
     comparison_new_price: float | None
     general_sale_price: float | None
     current_households: int
-    planned_households: int
     current_far: float | None
     target_far: float | None
     land_share: float | None
     site_area_sqm: float | None
-    building_coverage_ratio: float | None
+    current_building_coverage_ratio: float | None
+    target_building_coverage_ratio: float | None
     average_current_floors: float | None
-    public_price: float | None
+    floor_no: int
+    official_price_reference: float | None
     recent_same_complex_trade_price: float | None
     sale_rate: float | None
     cash_settlement_rate: float | None
     construction_cost_per_pyeong: float | None
     pf_rate: float | None
     move_loan_rate: float
-    general_sale_ratio: float | None
-    donation_ratio: float | None
-    rental_ratio: float | None
+    target_households_override: int | None
+    general_sale_ratio_override: float | None
+    donation_ratio_override: float | None
+    rental_ratio_override: float | None
     delay_one_year: bool
     aggressive_upsize: bool
     capital_area: bool
@@ -269,12 +346,8 @@ class QuickDealInputs:
 
 @dataclass
 class AdvancedProjectInputs:
-    expected_new_exclusive_area: float | None
-    appraised_old_asset_value: float | None
-    total_old_asset_value: float | None
-    adjustment_factor_override: float | None
-    total_market_value: float | None
-    member_price_text: str
+    rights_inputs: RightsInputs
+    unit_mix_rows: list[UnitMixRow]
     acquisition_rate: float
     annual_holding_rate: float
     capital_gains_effective_rate: float
@@ -296,6 +369,48 @@ class ConfidenceReport:
 
 
 @dataclass
+class SimulationResult:
+    site_area_sqm: float | None
+    site_source: str
+    current_gross_floor_area_sqm: float
+    gross_floor_area_sqm: float
+    average_supply_area_sqm: float
+    simulated_total_households: int
+    planned_households: int
+    member_households: int
+    general_sale_households: int
+    rental_households: int
+    donation_ratio: float
+    rental_ratio: float
+    general_sale_ratio: float
+    saleable_area_factor: float
+    required_avg_floors: float | None
+    public_facility_area_sqm: float | None
+    donation_area_sqm: float | None
+    sources: dict[str, str]
+
+
+@dataclass
+class FeasibilityCheck:
+    level: str
+    title: str
+    message: str
+
+
+@dataclass
+class AdvancedRightsResult:
+    old_asset_estimate: float
+    total_old_asset_value: float
+    rights_value: float
+    old_asset_source: str
+    total_old_asset_source: str
+    adjustment_factor: float
+    floor_factor: float
+    price_table: list[MemberPriceRecord]
+    allocation_options: list[dict[str, float | str]]
+
+
+@dataclass
 class QuickResult:
     scenario_name: str
     remaining_months: float
@@ -311,6 +426,11 @@ class QuickResult:
     summary_lines: list[str]
     source_records: list[SourceRecord]
     sensitivity_rows: list[dict[str, str]]
+    simulation_result: SimulationResult
+    feasibility_checks: list[FeasibilityCheck]
+    max_bid_price: float
+    break_even_purchase_price: float
+    advanced_rights_result: AdvancedRightsResult | None = None
     old_asset_estimate: float | None = None
     total_old_asset_value: float | None = None
     rights_value: float | None = None
@@ -511,12 +631,212 @@ def is_advanced_detail_available(stage: str, parsed_notice: ParsedProjectNotice 
     return False
 
 
+def guess_project_kind(text: str | None) -> ProjectKind:
+    raw = str(text or "")
+    if "재개발" in raw:
+        return ProjectKind.REDEVELOPMENT
+    return ProjectKind.RECONSTRUCTION
+
+
 def floor_factor(floor_no: int) -> float:
     if floor_no <= 3:
         return 0.98
     if floor_no >= 13:
         return 1.02
     return 1.00
+
+
+def parse_unit_mix_text(raw_text: str) -> list[UnitMixRow]:
+    rows: list[UnitMixRow] = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            rows.append(
+                UnitMixRow(
+                    label=parts[0],
+                    households=int(float(parts[1])),
+                    exclusive_area_sqm=float(parts[2]),
+                    supply_area_sqm=float(parts[3]),
+                )
+            )
+        except ValueError:
+            continue
+    return rows
+
+
+def weighted_average_supply_area(unit_mix_rows: list[UnitMixRow], default_supply_area: float) -> float:
+    if not unit_mix_rows:
+        return default_supply_area
+    weighted_area = sum(item.households * item.supply_area_sqm for item in unit_mix_rows)
+    total_households = sum(item.households for item in unit_mix_rows)
+    return safe_div(weighted_area, total_households, default_supply_area)
+
+
+def estimate_current_gross_floor_area_sqm(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedProjectInputs) -> float:
+    if advanced_inputs.unit_mix_rows:
+        return sum(item.households * item.supply_area_sqm for item in advanced_inputs.unit_mix_rows) * 1.08
+    return quick_inputs.current_households * quick_inputs.current_unit_supply_area * 1.08
+
+
+def estimate_member_base_count(quick_inputs: QuickDealInputs, base_cash_rate: float) -> int:
+    project = quick_inputs.autofill_project
+    if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT:
+        seed = (project.owner_count if project and project.owner_count else None) or quick_inputs.current_households
+    else:
+        seed = (project.current_households if project and project.current_households else None) or quick_inputs.current_households
+    return max(int(round(seed * (1 - base_cash_rate))), 1)
+
+
+def estimate_donation_ratio(quick_inputs: QuickDealInputs, profile: dict[str, float]) -> tuple[float, str]:
+    if quick_inputs.donation_ratio_override is not None:
+        return clamp(quick_inputs.donation_ratio_override, 0.0, 0.40), "manual_override"
+    project = quick_inputs.autofill_project
+    if project and project.public_facility_area_sqm is not None and project.official_area_sqm:
+        return clamp(project.public_facility_area_sqm / project.official_area_sqm, 0.0, 0.40), "official_cleanup"
+    base_ratio = profile["donation_ratio"]
+    if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT:
+        base_ratio = max(base_ratio, 0.10)
+    return clamp(base_ratio, 0.0, 0.40), "preset"
+
+
+def estimate_rental_ratio(quick_inputs: QuickDealInputs, profile: dict[str, float]) -> tuple[float, str]:
+    if quick_inputs.rental_ratio_override is not None:
+        return clamp(quick_inputs.rental_ratio_override, 0.0, 0.40), "manual_override"
+    project = quick_inputs.autofill_project
+    if project and project.rental_households is not None and project.planned_households is not None:
+        return clamp(project.rental_households / max(project.planned_households, 1), 0.0, 0.40), "official_cleanup"
+    base_ratio = profile["rental_ratio"]
+    if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT:
+        base_ratio = max(base_ratio, 0.12)
+    else:
+        base_ratio = min(base_ratio, 0.03)
+    return clamp(base_ratio, 0.0, 0.40), "preset"
+
+
+def simulate_project_plan(
+    quick_inputs: QuickDealInputs,
+    advanced_inputs: AdvancedProjectInputs,
+    base_cash_rate: float,
+    profile: dict[str, float],
+) -> SimulationResult:
+    current_gross_floor_area_sqm = estimate_current_gross_floor_area_sqm(quick_inputs, advanced_inputs)
+    site_area_sqm, site_source = estimate_site_area(quick_inputs, current_gross_floor_area_sqm)
+    donation_ratio, donation_source = estimate_donation_ratio(quick_inputs, profile)
+    rental_ratio, rental_source = estimate_rental_ratio(quick_inputs, profile)
+    average_supply_area_sqm = weighted_average_supply_area(advanced_inputs.unit_mix_rows, quick_inputs.current_unit_supply_area)
+
+    if site_area_sqm and quick_inputs.target_far:
+        gross_floor_area_sqm = site_area_sqm * (quick_inputs.target_far / 100.0)
+    elif quick_inputs.current_far and quick_inputs.target_far:
+        gross_floor_area_sqm = current_gross_floor_area_sqm * safe_div(quick_inputs.target_far, quick_inputs.current_far, 1.0)
+    else:
+        growth_multiplier = 1.28 if quick_inputs.project_kind == ProjectKind.RECONSTRUCTION else 1.38
+        gross_floor_area_sqm = current_gross_floor_area_sqm * growth_multiplier
+
+    saleable_area_factor = clamp(1.0 - donation_ratio, 0.55, 1.0)
+    residential_efficiency = 0.84 if quick_inputs.project_kind == ProjectKind.RECONSTRUCTION else 0.80
+    simulated_total_households = max(
+        int(round((gross_floor_area_sqm * residential_efficiency * saleable_area_factor) / max(average_supply_area_sqm, 1.0))),
+        1,
+    )
+    project = quick_inputs.autofill_project
+    if quick_inputs.target_households_override is not None:
+        planned_households = quick_inputs.target_households_override
+        households_source = "manual_override"
+    elif project and project.planned_households is not None:
+        planned_households = project.planned_households
+        households_source = "official_cleanup"
+    else:
+        planned_households = simulated_total_households
+        households_source = "simulation"
+
+    member_households = estimate_member_base_count(quick_inputs, base_cash_rate)
+    if project and project.rental_households is not None and project.planned_households is not None and quick_inputs.rental_ratio_override is None:
+        rental_households = project.rental_households
+        rental_source = "official_cleanup"
+    else:
+        rental_households = int(round(planned_households * rental_ratio))
+
+    available_general_sale = max(planned_households - member_households - rental_households, 0)
+    if project and project.sale_households is not None and project.planned_households is not None and quick_inputs.general_sale_ratio_override is None:
+        general_sale_households = min(project.sale_households, available_general_sale)
+        general_sale_source = "official_cleanup"
+    elif quick_inputs.general_sale_ratio_override is not None:
+        requested_ratio = clamp(quick_inputs.general_sale_ratio_override, 0.0, 0.60)
+        general_sale_households = min(int(round(max(planned_households - rental_households, 0) * requested_ratio)), available_general_sale)
+        general_sale_source = "manual_override"
+    else:
+        general_sale_households = available_general_sale
+        general_sale_source = "simulation"
+    general_sale_ratio = safe_div(general_sale_households, max(planned_households - rental_households, 1), 0.0)
+
+    required_avg_floors = None
+    if quick_inputs.target_building_coverage_ratio and quick_inputs.target_building_coverage_ratio > 0:
+        required_avg_floors = (quick_inputs.target_far / 100.0) / quick_inputs.target_building_coverage_ratio if quick_inputs.target_far else None
+
+    return SimulationResult(
+        site_area_sqm=site_area_sqm,
+        site_source=site_source,
+        current_gross_floor_area_sqm=current_gross_floor_area_sqm,
+        gross_floor_area_sqm=gross_floor_area_sqm,
+        average_supply_area_sqm=average_supply_area_sqm,
+        simulated_total_households=simulated_total_households,
+        planned_households=planned_households,
+        member_households=member_households,
+        general_sale_households=general_sale_households,
+        rental_households=rental_households,
+        donation_ratio=donation_ratio,
+        rental_ratio=rental_ratio,
+        general_sale_ratio=general_sale_ratio,
+        saleable_area_factor=saleable_area_factor,
+        required_avg_floors=required_avg_floors,
+        public_facility_area_sqm=project.public_facility_area_sqm if project else None,
+        donation_area_sqm=project.donation_area_sqm if project else None,
+        sources={
+            "households": households_source,
+            "general_sale_ratio": general_sale_source,
+            "donation_ratio": donation_source,
+            "rental_ratio": rental_source,
+        },
+    )
+
+
+def build_feasibility_checks(
+    quick_inputs: QuickDealInputs,
+    simulation: SimulationResult,
+) -> list[FeasibilityCheck]:
+    checks: list[FeasibilityCheck] = []
+    if simulation.required_avg_floors is not None:
+        if simulation.required_avg_floors > 35:
+            checks.append(FeasibilityCheck("risk", "층수 부담", f"목표 FAR와 목표 건폐율 기준 평균 {simulation.required_avg_floors:.1f}층이 필요해 과도할 수 있습니다."))
+        elif simulation.required_avg_floors > 25:
+            checks.append(FeasibilityCheck("warn", "층수 부담", f"목표 FAR와 목표 건폐율 기준 평균 {simulation.required_avg_floors:.1f}층이 필요합니다. 인허가·사업성 검토가 더 필요합니다."))
+        else:
+            checks.append(FeasibilityCheck("ok", "층수 부담", f"목표 FAR와 목표 건폐율 기준 평균 {simulation.required_avg_floors:.1f}층 수준으로 계산됩니다."))
+    else:
+        checks.append(FeasibilityCheck("note", "층수 점검", "목표 건폐율이 없어서 평균층수 점검은 생략했습니다."))
+
+    if simulation.planned_households > int(simulation.simulated_total_households * 1.15):
+        checks.append(FeasibilityCheck("warn", "세대수 과다 가능성", f"입력/공식 계획 세대수 {simulation.planned_households:,}세대가 엔진 추정 {simulation.simulated_total_households:,}세대보다 많이 큽니다."))
+    elif simulation.planned_households < simulation.member_households:
+        checks.append(FeasibilityCheck("risk", "세대수 부족", f"예상 총세대수 {simulation.planned_households:,}세대로는 분양대상 {simulation.member_households:,}세대를 담기 어렵습니다."))
+    else:
+        checks.append(FeasibilityCheck("ok", "세대수 점검", f"예상 총세대수 {simulation.planned_households:,}세대, 일반분양 {simulation.general_sale_households:,}세대로 계산했습니다."))
+
+    if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT:
+        tenant_seed = quick_inputs.autofill_project.tenant_count if quick_inputs.autofill_project else None
+        if tenant_seed:
+            checks.append(FeasibilityCheck("ok", "세입자 반영", f"서울 공식값 기준 세입자 {tenant_seed:,}명을 보상비 추정에 반영했습니다."))
+        else:
+            checks.append(FeasibilityCheck("note", "세입자 반영", "세입자 수 공식값이 없어 재개발 세입자 보상은 보수적 휴리스틱으로 계산했습니다."))
+    else:
+        checks.append(FeasibilityCheck("note", "재건축 비용 구조", "재건축은 기본적으로 주거이전비·영업손실보상비를 자동 적용하지 않았습니다."))
+    return checks
 
 
 def adjustment_factor(
@@ -933,6 +1253,7 @@ def cleanup_search_projects(query: str) -> list[AutofillProjectData]:
                 project_name=cells[3],
                 district=cells[1],
                 business_type=cells[2],
+                project_kind=guess_project_kind(cells[2]),
                 progress_stage=normalize_stage_name(cells[5]),
                 representative_lot=cells[4],
                 project_slug=slug,
@@ -961,9 +1282,17 @@ def extract_links(html_text: str) -> list[tuple[str, str]]:
     return parser.items
 
 
-def extract_households_from_supply_row(row: list[str]) -> int | None:
+def extract_households_from_supply_table(table: list[list[str]]) -> int | None:
+    if len(table) < 3:
+        return None
+    header_row = table[0]
+    data_row = table[-1]
+    try:
+        start_idx = header_row.index("동수") + 1
+    except ValueError:
+        start_idx = 4
     counts: list[int] = []
-    for cell in row[3:]:
+    for cell in data_row[start_idx:]:
         stripped = cell.replace(",", "")
         if not stripped or "." in stripped:
             continue
@@ -974,18 +1303,56 @@ def extract_households_from_supply_row(row: list[str]) -> int | None:
     return sum(counts) if counts else None
 
 
+def extract_public_facility_areas(
+    land_use_table: list[list[str]],
+    facility_table: list[list[str]],
+) -> tuple[float | None, float | None]:
+    land_public_area = None
+    if len(land_use_table) >= 3:
+        numeric_cells = [parse_float(cell) for cell in land_use_table[-1]]
+        valid_values = [value for value in numeric_cells if value is not None]
+        if len(valid_values) > 1:
+            land_public_area = sum(valid_values[1:])
+
+    facility_public_area = 0.0
+    donation_area = 0.0
+    for row in facility_table[1:]:
+        if len(row) < 3:
+            continue
+        area = parse_float(row[2])
+        if area is None:
+            continue
+        facility_public_area += area
+        if len(row) > 3 and "기부채납" in row[3]:
+            donation_area += area
+
+    public_area = None
+    candidates = [value for value in (land_public_area, facility_public_area or None) if value is not None]
+    if candidates:
+        public_area = max(candidates)
+    return public_area, donation_area or None
+
+
 def normalize_cleanup_source_rows(project: AutofillProjectData) -> list[SourceRecord]:
     rows = list(project.source_records)
     if project.site_area_sqm is not None:
         rows.append(record("site_area_sqm", f"{project.site_area_sqm:,.1f}", "official_cleanup", 0.88))
-    if project.building_coverage_ratio is not None:
-        rows.append(record("building_coverage_ratio", f"{project.building_coverage_ratio:.1f}", "official_cleanup", 0.86))
+    if project.target_building_coverage_ratio is not None:
+        rows.append(record("building_coverage_ratio", f"{project.target_building_coverage_ratio:.1f}", "official_cleanup", 0.86))
     if project.target_far is not None:
         rows.append(record("target_far", f"{project.target_far:.1f}", "official_cleanup", 0.86))
     if project.current_households is not None:
         rows.append(record("current_households", str(project.current_households), "official_cleanup", 0.86))
     if project.planned_households is not None:
         rows.append(record("planned_households", str(project.planned_households), "official_cleanup", 0.82))
+    if project.sale_households is not None:
+        rows.append(record("sale_households", str(project.sale_households), "official_cleanup", 0.80))
+    if project.rental_households is not None:
+        rows.append(record("rental_households", str(project.rental_households), "official_cleanup", 0.80))
+    if project.public_facility_area_sqm is not None:
+        rows.append(record("public_facility_area_sqm", f"{project.public_facility_area_sqm:,.1f}", "official_cleanup", 0.78))
+    if project.donation_area_sqm is not None:
+        rows.append(record("donation_area_sqm", f"{project.donation_area_sqm:,.1f}", "official_cleanup", 0.76))
     return rows
 
 
@@ -1007,26 +1374,28 @@ def cleanup_fetch_project_summary(project_slug: str) -> AutofillProjectData | No
     summary_html = fetch_html(summary_url)
     tables = extract_tables(summary_html)
     basics = tables[0] if len(tables) > 0 else []
+    land_use_table = tables[2] if len(tables) > 2 else []
     building_table = tables[3] if len(tables) > 3 else []
     sale_table = tables[4] if len(tables) > 4 else []
     rental_table = tables[5] if len(tables) > 5 else []
+    facility_table = tables[6] if len(tables) > 6 else []
     basics_map: dict[str, str] = {}
     for row in basics:
         for idx in range(0, len(row) - 1, 2):
             basics_map[row[idx]] = row[idx + 1]
     building_row = building_table[1] if len(building_table) > 1 else []
-    sale_row = sale_table[-1] if sale_table else []
-    rental_row = rental_table[-1] if rental_table else []
     current_households = parse_int(basics_map.get("조합원 수", "").replace("명", ""))
     owner_count = parse_int((basics_map.get("토지등 소유자 수", "") or "").replace("명", ""))
     tenant_count = parse_int((basics_map.get("세입자 수", "") or "").replace("명", ""))
-    planned_sale = extract_households_from_supply_row(sale_row)
-    planned_rental = extract_households_from_supply_row(rental_row)
+    planned_sale = extract_households_from_supply_table(sale_table)
+    planned_rental = extract_households_from_supply_table(rental_table)
+    public_facility_area_sqm, donation_area_sqm = extract_public_facility_areas(land_use_table, facility_table)
     project = AutofillProjectData(
         query=project_slug,
         project_name=basics_map.get("정비구역 명칭", project_slug),
         district=(basics_map.get("정비구역 위치", "").split()[0] if basics_map.get("정비구역 위치") else ""),
         business_type=basics_map.get("사업구분", ""),
+        project_kind=guess_project_kind(basics_map.get("사업구분", "")),
         progress_stage=None,
         representative_lot=basics_map.get("정비구역 위치", ""),
         project_slug=project_slug,
@@ -1036,13 +1405,16 @@ def cleanup_fetch_project_summary(project_slug: str) -> AutofillProjectData | No
         site_area_sqm=parse_float(building_row[1]) if len(building_row) > 1 else None,
         building_area_sqm=parse_float(building_row[2]) if len(building_row) > 2 else None,
         gross_floor_area_sqm=parse_float(building_row[3]) if len(building_row) > 3 else None,
-        building_coverage_ratio=parse_float(building_row[4]) if len(building_row) > 4 else None,
+        target_building_coverage_ratio=parse_float(building_row[4]) if len(building_row) > 4 else None,
         target_far=parse_float(building_row[5]) if len(building_row) > 5 else None,
         current_households=current_households,
         owner_count=owner_count,
         tenant_count=tenant_count,
         planned_households=(planned_sale or 0) + (planned_rental or 0) or None,
+        sale_households=planned_sale,
         rental_households=planned_rental,
+        public_facility_area_sqm=public_facility_area_sqm,
+        donation_area_sqm=donation_area_sqm,
     )
     project.schedule_text = cleanup_fetch_schedule_text(cafe_id)
     project.source_records = normalize_cleanup_source_rows(project)
@@ -1091,17 +1463,16 @@ def estimate_remaining_months(stage: str, autofill: AutofillProjectData | None, 
     return months, source
 
 
-def estimate_site_area(inputs: QuickDealInputs) -> tuple[float | None, str]:
+def estimate_site_area(inputs: QuickDealInputs, current_gross_floor_area_sqm: float) -> tuple[float | None, str]:
     if inputs.land_share:
         return inputs.land_share * inputs.current_households, "manual"
     if inputs.site_area_sqm:
         return inputs.site_area_sqm, "official_cleanup" if inputs.lookup_enabled else "manual"
-    current_gross_floor_area_sqm = inputs.current_households * inputs.current_unit_supply_area * 1.08
     if inputs.current_far:
-        return current_gross_floor_area_sqm / max(inputs.current_far / 100.0, 0.01), "engine"
-    if inputs.building_coverage_ratio and inputs.average_current_floors:
-        return current_gross_floor_area_sqm / max(inputs.building_coverage_ratio * inputs.average_current_floors, 0.01), "engine"
-    return None, "engine"
+        return current_gross_floor_area_sqm / max(inputs.current_far / 100.0, 0.01), "simulation"
+    if inputs.current_building_coverage_ratio and inputs.average_current_floors:
+        return current_gross_floor_area_sqm / max(inputs.current_building_coverage_ratio * inputs.average_current_floors, 0.01), "simulation"
+    return None, "simulation"
 
 
 def build_cost_buckets(base_amounts: dict[str, float], overrides: dict[str, float], document_buckets: dict[str, float]) -> list[CostBucket]:
@@ -1127,6 +1498,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     scenario = SCENARIOS[scenario_name]
     profile = ASSUMPTION_PROFILES[quick_inputs.scenario_profile]
     parsed_notice = quick_inputs.parsed_notice
+    rights_inputs = advanced_inputs.rights_inputs
     records: list[SourceRecord] = []
 
     remaining_months, duration_source = estimate_remaining_months(
@@ -1140,78 +1512,71 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     base_cash_rate = quick_inputs.cash_settlement_rate if quick_inputs.cash_settlement_rate is not None else scenario["cash_settlement_rate"]
     base_cost_per_pyeong = quick_inputs.construction_cost_per_pyeong or scenario["construction_cost_per_pyeong"]
     base_pf_rate = quick_inputs.pf_rate or scenario["pf_rate"]
-    donation_ratio = clamp(quick_inputs.donation_ratio if quick_inputs.donation_ratio is not None else profile["donation_ratio"], 0.0, 0.40)
-    rental_ratio = clamp(quick_inputs.rental_ratio if quick_inputs.rental_ratio is not None else profile["rental_ratio"], 0.0, 0.40)
-    general_sale_ratio = clamp(quick_inputs.general_sale_ratio if quick_inputs.general_sale_ratio is not None else profile["general_sale_ratio"], 0.0, 0.50)
+    simulation = simulate_project_plan(quick_inputs, advanced_inputs, base_cash_rate, profile)
 
+    official_price_reference = rights_inputs.official_price_reference or quick_inputs.official_price_reference
     adj_factor, adj_source = adjustment_factor(
-        public_price=quick_inputs.public_price,
+        public_price=official_price_reference,
         recent_trade=quick_inputs.recent_same_complex_trade_price,
-        override_value=advanced_inputs.adjustment_factor_override,
+        override_value=rights_inputs.adjustment_factor_override,
         old_asset_formula=parsed_notice.old_asset_formula if parsed_notice else None,
         applied_fields=quick_inputs.applied_document_fields,
         capital_area=quick_inputs.capital_area,
     )
     floor_adj = floor_factor(quick_inputs.floor_no)
-    if advanced_inputs.appraised_old_asset_value:
-        old_asset_estimate = advanced_inputs.appraised_old_asset_value
+    if rights_inputs.appraised_old_asset_value:
+        old_asset_estimate = rights_inputs.appraised_old_asset_value
         old_asset_source = "manual_appraisal"
-    elif quick_inputs.public_price:
-        old_asset_estimate = quick_inputs.public_price * adj_factor * floor_adj
+    elif official_price_reference:
+        old_asset_estimate = official_price_reference * adj_factor * floor_adj
         old_asset_source = "public_price_adjusted"
     elif quick_inputs.recent_same_complex_trade_price:
         old_asset_estimate = quick_inputs.recent_same_complex_trade_price * floor_adj
         old_asset_source = "trade_backsolve"
     else:
-        old_asset_estimate = quick_inputs.purchase_price * 0.78 * floor_adj
+        fallback_multiplier = 0.78 if quick_inputs.project_kind == ProjectKind.RECONSTRUCTION else 0.74
+        old_asset_estimate = quick_inputs.purchase_price * fallback_multiplier * floor_adj
         old_asset_source = "purchase_price_heuristic"
 
-    member_count = max(int(round(quick_inputs.current_households * (1 - base_cash_rate))), 1)
+    member_count = simulation.member_households
     if parsed_notice and parsed_notice.cost_items.get("total_old_asset_value") and "total_old_asset_value" in quick_inputs.applied_document_fields:
         total_old_asset_value = parsed_notice.cost_items["total_old_asset_value"]
         total_old_asset_source = "document_total_old_asset"
-    elif advanced_inputs.total_old_asset_value:
-        total_old_asset_value = advanced_inputs.total_old_asset_value
+    elif rights_inputs.total_old_asset_value:
+        total_old_asset_value = rights_inputs.total_old_asset_value
         total_old_asset_source = "user_total_old_asset"
     else:
         total_old_asset_value = old_asset_estimate * member_count
         total_old_asset_source = "scaled_individual_old_asset"
 
     price_table = default_member_price_table(
-        user_text=advanced_inputs.member_price_text,
+        user_text=rights_inputs.member_price_text,
         doc_table=parsed_notice.member_price_table if parsed_notice else [],
         use_doc_table=quick_inputs.use_doc_price_table,
         comparison_new_price=quick_inputs.comparison_new_price,
         general_sale_price=quick_inputs.general_sale_price,
         purchase_price=quick_inputs.purchase_price,
         current_exclusive_area=quick_inputs.current_unit_exclusive_area,
-        expected_new_area=advanced_inputs.expected_new_exclusive_area,
+        expected_new_area=rights_inputs.expected_new_exclusive_area,
     )
 
-    site_area_sqm, site_source = estimate_site_area(quick_inputs)
-    current_gross_floor_area_sqm = quick_inputs.current_households * quick_inputs.current_unit_supply_area * 1.08
-    if site_area_sqm and quick_inputs.target_far:
-        gross_floor_area_sqm = site_area_sqm * (quick_inputs.target_far / 100.0)
-    elif quick_inputs.current_far and quick_inputs.target_far:
-        gross_floor_area_sqm = current_gross_floor_area_sqm * safe_div(quick_inputs.target_far, quick_inputs.current_far, 1.0)
-    else:
-        avg_supply = statistics.mean(item.supply_area_sqm for item in price_table)
-        gross_floor_area_sqm = quick_inputs.planned_households * avg_supply * 1.15
-    gross_floor_area_pyeong = gross_floor_area_sqm / 3.3058
-    current_gross_area_pyeong = current_gross_floor_area_sqm / 3.3058
+    general_sale_households = simulation.general_sale_households
+    rental_households = simulation.rental_households
+    donation_ratio = simulation.donation_ratio
+    rental_ratio = simulation.rental_ratio
+    general_sale_ratio = simulation.general_sale_ratio
+    gross_floor_area_pyeong = simulation.gross_floor_area_sqm / 3.3058
+    current_gross_area_pyeong = simulation.current_gross_floor_area_sqm / 3.3058
 
     direct_construction_cost = gross_floor_area_pyeong * base_cost_per_pyeong
     if quick_inputs.delay_one_year and quick_inputs.current_stage not in {"착공", "준공/입주"}:
         direct_construction_cost *= 1.04
     demolition_cost = current_gross_area_pyeong * base_cost_per_pyeong * 0.06
-    design_and_pm_cost = direct_construction_cost * 0.06
-    union_and_professional_cost = direct_construction_cost * 0.018 + quick_inputs.current_households * 8_000_000.0
-
-    saleable_area_factor = clamp(1.0 - donation_ratio, 0.55, 1.0)
-    rental_households = int(round(quick_inputs.planned_households * rental_ratio))
-    saleable_households_capacity = max(int(round(quick_inputs.planned_households * saleable_area_factor)) - rental_households, member_count)
-    ratio_based_general_sale = int(round(max(quick_inputs.planned_households - rental_households, 0) * general_sale_ratio))
-    general_sale_households = max(min(ratio_based_general_sale, saleable_households_capacity - member_count), 0)
+    design_ratio = 0.06 if quick_inputs.project_kind == ProjectKind.RECONSTRUCTION else 0.065
+    design_and_pm_cost = direct_construction_cost * design_ratio
+    union_and_professional_cost = direct_construction_cost * 0.018 + member_count * 8_000_000.0
+    if quick_inputs.project_kind == ProjectKind.RECONSTRUCTION and quick_inputs.current_stage == "재건축진단":
+        union_and_professional_cost += max(member_count * 250_000.0, 80_000_000.0)
 
     average_member_sale_price = statistics.mean(item.member_sale_price for item in price_table)
     benchmark_new_price = quick_inputs.comparison_new_price or quick_inputs.general_sale_price or average_member_sale_price / 0.85
@@ -1222,10 +1587,17 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     other_disposal_revenue = advanced_inputs.other_disposal_revenue or direct_construction_cost * 0.01
 
     sales_expense = general_sale_revenue * 0.025
+    tenant_count = (quick_inputs.autofill_project.tenant_count if quick_inputs.autofill_project else None) or 0
+    housing_relocation_cost = 0.0
+    business_loss_cost = 0.0
+    if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT:
+        eligible_tenants = max(int(round((tenant_count or member_count * 0.18) * 0.33)), 1)
+        housing_relocation_cost = eligible_tenants * 18_000_000.0
+        business_loss_cost = eligible_tenants * 6_000_000.0
     settlement_and_litigation_cost = (
         advanced_inputs.liquidation_cost_override
         if advanced_inputs.liquidation_cost_override is not None
-        else total_old_asset_value * (0.005 + base_cash_rate * 0.08)
+        else total_old_asset_value * (0.005 + base_cash_rate * 0.08) + housing_relocation_cost + business_loss_cost
     )
     pf_principal = max((direct_construction_cost + demolition_cost + design_and_pm_cost + sales_expense + union_and_professional_cost) * 0.60, 0.0)
     financing_cost = pf_principal * base_pf_rate * 0.55 * (remaining_months / 12.0)
@@ -1303,7 +1675,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     allocations.sort(key=lambda row: float(row["점수"]), reverse=True)
     selected = allocations[0] if allocations else None
     quick_additional_cash = max(average_member_sale_price - rights_value, 0.0)
-    selected_additional_cash = float(selected["예상 추가분담금"]) if selected else quick_additional_cash
+    selected_additional_cash = max(float(selected["예상 추가분담금"]), 0.0) if selected else quick_additional_cash
 
     exits: list[dict[str, float | str | None]] = []
     for exit_name in EXIT_SCENARIOS:
@@ -1340,6 +1712,10 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         roi = safe_div(after_tax_profit, total_outflow, 0.0)
         net_exit_inflow = gross_exit_value - disposal_cost - max(pretax_profit, 0.0) * advanced_inputs.capital_gains_effective_rate
         irr = (net_exit_inflow / total_outflow) ** (1.0 / years) - 1.0 if total_outflow > 0 and net_exit_inflow > 0 else None
+        break_even_purchase = max(
+            (gross_exit_value - disposal_cost - holding_cost - max(selected_additional_cash, 0.0) - capital_interest) / max(1.0 + advanced_inputs.acquisition_rate, 0.01),
+            0.0,
+        )
         exits.append(
             {
                 "엑시트": exit_name,
@@ -1351,16 +1727,23 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
                 "IRR": irr,
                 "보유비용": holding_cost,
                 "시간비용": holding_cost + capital_interest,
+                "손익분기 매수가": break_even_purchase,
+                "권장 최대 매수가": break_even_purchase * 0.90,
             }
         )
 
     selected_exit = next(item for item in exits if item["엑시트"] == "준공 직후 매도")
     time_cost_to_exit = float(selected_exit["시간비용"])
+    break_even_purchase_price = float(selected_exit["손익분기 매수가"])
+    max_bid_price = float(selected_exit["권장 최대 매수가"])
     project_summary = {
         "총수입": total_revenue,
         "총지출": total_cost,
         "추정비례율": proportional_ratio,
         "세대당 평균 추가분담금": max(average_member_sale_price - rights_value, 0.0),
+        "예상 총세대수": float(simulation.planned_households),
+        "엔진 추정 총세대수": float(simulation.simulated_total_households),
+        "일반분양 비율": general_sale_ratio,
         "일반분양 세대수": float(general_sale_households),
         "임대주택 세대수": float(rental_households),
         "기부채납 비율": donation_ratio,
@@ -1373,22 +1756,22 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         sum(
             [
                 bool(quick_inputs.current_households),
-                bool(quick_inputs.planned_households),
-                quick_inputs.land_share is not None or quick_inputs.site_area_sqm is not None,
                 quick_inputs.current_far is not None,
                 quick_inputs.target_far is not None,
-                bool(price_table),
+                quick_inputs.target_building_coverage_ratio is not None,
+                bool(quick_inputs.general_sale_price or quick_inputs.comparison_new_price),
+                simulation.site_area_sqm is not None,
             ]
         )
         / 6.0
     ) * 100.0
-    autofill_strength = 92.0 if quick_inputs.lookup_enabled and quick_inputs.autofill_project else 55.0
+    autofill_strength = 92.0 if quick_inputs.lookup_enabled and quick_inputs.autofill_project else 58.0
     schedule_certainty = 85.0 if duration_source == "schedule_board" else clamp(100.0 - STAGE_BASE_MONTHS.get(quick_inputs.current_stage, 72) * 0.45, 22.0, 88.0)
     valuation_strength = statistics.mean(
         [
-            0.96 if old_asset_source == "manual_appraisal" else 0.82 if old_asset_source == "public_price_adjusted" else 0.68 if old_asset_source == "trade_backsolve" else 0.42,
-            0.95 if total_old_asset_source == "user_total_old_asset" else 0.88 if total_old_asset_source == "document_total_old_asset" else 0.54,
-            0.84 if adj_source == "document_formula" else 0.78 if adj_source == "trade_vs_public" else 0.44,
+            0.96 if old_asset_source == "manual_appraisal" else 0.82 if old_asset_source == "public_price_adjusted" else 0.68 if old_asset_source == "trade_backsolve" else 0.48,
+            0.90 if simulation.sources["households"] == "official_cleanup" else 0.75 if simulation.sources["households"] == "manual_override" else 0.60,
+            0.84 if adj_source == "document_formula" else 0.78 if adj_source == "trade_vs_public" else 0.58,
         ]
     ) * 100.0
     confidence_total = input_completion * 0.35 + autofill_strength * 0.20 + schedule_certainty * 0.20 + valuation_strength * 0.25
@@ -1411,12 +1794,14 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             variant_ratio = safe_div(variant_total_revenue - variant_total_cost, total_old_asset_value, 0.0) * 100.0
             sensitivity_rows.append({"판매율": f"{sale_rate * 100:.0f}%", "공사비 배수": f"{cost_multiplier:.2f}x", "비례율": f"{variant_ratio:.2f}%"})
 
-    land_share_est = safe_div(site_area_sqm or 0.0, quick_inputs.current_households, 0.0) if site_area_sqm else 0.0
+    land_share_est = safe_div(simulation.site_area_sqm or 0.0, quick_inputs.current_households, 0.0) if simulation.site_area_sqm else 0.0
     top_drivers = simple_top_drivers(time_cost_to_exit, direct_construction_cost, selected_additional_cash)
+    cost_note = "재개발 세입자 보상비를 포함했습니다." if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT else "재건축은 주거이전비·영업손실보상비를 기본 제외했습니다."
     summary_lines = [
         f"준공 직후 매도 기준 세후순이익은 {fmt_money(float(selected_exit['세후 순이익']))}이고 ROI는 {fmt_pct(float(selected_exit['ROI']))}입니다.",
-        f"예상 추가투입금은 {fmt_money(selected_additional_cash)}이며, 시간비용은 {fmt_money(time_cost_to_exit)} 수준으로 추정했습니다.",
-        f"대지지분은 세대당 약 {land_share_est:,.2f}㎡로 추정했고 출처는 {humanize_source(site_source)}입니다.",
+        f"예상 총세대수는 {simulation.planned_households:,}세대, 일반분양은 {general_sale_households:,}세대({fmt_pct(general_sale_ratio)})로 계산했습니다.",
+        f"손익분기 매수가는 {fmt_money(break_even_purchase_price)}, 권장 최대 매수가는 {fmt_money(max_bid_price)}입니다.",
+        f"대지지분은 세대당 약 {land_share_est:,.2f}㎡로 추정했고 출처는 {humanize_source(simulation.site_source)}입니다. {cost_note}",
         f"가장 영향이 큰 요인은 {', '.join(top_drivers)}입니다.",
     ]
 
@@ -1429,6 +1814,8 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             record("total_revenue", f"{total_revenue:,.0f}", "engine", 0.70),
             record("total_cost", f"{total_cost:,.0f}", "engine", 0.70),
             record("proportional_ratio", f"{proportional_ratio:.2f}", "engine", 0.70),
+            record("planned_households", str(simulation.planned_households), simulation.sources["households"], 0.70),
+            record("general_sale_ratio", f"{general_sale_ratio * 100:.2f}%", simulation.sources["general_sale_ratio"], 0.68),
         ]
     )
 
@@ -1455,6 +1842,25 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         summary_lines=summary_lines,
         source_records=records,
         sensitivity_rows=sensitivity_rows,
+        simulation_result=simulation,
+        feasibility_checks=build_feasibility_checks(quick_inputs, simulation),
+        max_bid_price=max_bid_price,
+        break_even_purchase_price=break_even_purchase_price,
+        advanced_rights_result=(
+            AdvancedRightsResult(
+                old_asset_estimate=old_asset_estimate,
+                total_old_asset_value=total_old_asset_value,
+                rights_value=rights_value,
+                old_asset_source=old_asset_source,
+                total_old_asset_source=total_old_asset_source,
+                adjustment_factor=adj_factor,
+                floor_factor=floor_adj,
+                price_table=price_table,
+                allocation_options=allocations,
+            )
+            if show_advanced_detail
+            else None
+        ),
         old_asset_estimate=old_asset_estimate if show_advanced_detail else None,
         total_old_asset_value=total_old_asset_value if show_advanced_detail else None,
         rights_value=rights_value if show_advanced_detail else None,
@@ -1589,9 +1995,10 @@ def render_project_autofill(project: AutofillProjectData | None) -> None:
     st.markdown(
         "<div class='section-card'>"
         f"<div class='soft-title'>{escape(project.project_name)}</div>"
-        f"<div>{source_badge('서울 공식값 사용', 'ok')}{source_badge(project.business_type or '사업유형 미확인')}</div>"
-        f"<p class='mini-note'>대표지번: {escape(project.representative_lot or '-')} / 조합원 수: {project.current_households or '-'} / 계획 세대수: {project.planned_households or '-'}</p>"
-        f"<p class='mini-note'>건폐율: {project.building_coverage_ratio or '-'}% / 용적률: {project.target_far or '-'}% / 출처: 서울 정비사업 정보몽땅</p>"
+        f"<div>{source_badge('서울 공식값 사용', 'ok')}{source_badge(project.business_type or '사업유형 미확인')}{source_badge((project.project_kind.value if project.project_kind else '유형 미확인'), 'base')}</div>"
+        f"<p class='mini-note'>대표지번: {escape(project.representative_lot or '-')} / 조합원·권리자 수: {project.current_households or project.owner_count or '-'} / 계획 세대수: {project.planned_households or '-'}</p>"
+        f"<p class='mini-note'>목표 건폐율: {project.target_building_coverage_ratio or '-'}% / 목표 용적률: {project.target_far or '-'}% / 일반분양: {project.sale_households or '-'}세대 / 임대: {project.rental_households or '-'}세대</p>"
+        f"<p class='mini-note'>공공시설 반영면적: {project.public_facility_area_sqm or '-'}㎡ / 명시 기부채납: {project.donation_area_sqm or '-'}㎡ / 출처: 서울 정비사업 정보몽땅</p>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1603,6 +2010,9 @@ def project_summary_rows(result: QuickResult) -> list[dict[str, str]]:
         {"항목": "총지출", "값": fmt_money(result.project_summary["총지출"])},
         {"항목": "추정비례율", "값": fmt_plain_pct(result.project_summary["추정비례율"])},
         {"항목": "세대당 평균 추가분담금", "값": fmt_money(result.project_summary["세대당 평균 추가분담금"])},
+        {"항목": "예상 총세대수", "값": f"{int(result.project_summary['예상 총세대수']):,}세대"},
+        {"항목": "엔진 추정 총세대수", "값": f"{int(result.project_summary['엔진 추정 총세대수']):,}세대"},
+        {"항목": "일반분양 비율", "값": fmt_pct(result.project_summary["일반분양 비율"])},
         {"항목": "일반분양 세대수", "값": f"{int(result.project_summary['일반분양 세대수']):,}세대"},
         {"항목": "임대주택 세대수", "값": f"{int(result.project_summary['임대주택 세대수']):,}세대"},
         {"항목": "기부채납 비율", "값": fmt_pct(result.project_summary["기부채납 비율"])},
@@ -1621,6 +2031,7 @@ def exit_rows(result: QuickResult) -> list[dict[str, str]]:
                 "ROI": fmt_pct(float(item["ROI"])),
                 "IRR": "-" if item["IRR"] is None else fmt_pct(float(item["IRR"])),
                 "시간비용": fmt_money(float(item["시간비용"])),
+                "손익분기 매수가": fmt_money(float(item["손익분기 매수가"])),
             }
         )
     return rows
@@ -1646,6 +2057,26 @@ def bucket_rows(result: QuickResult) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for bucket in result.cost_buckets:
         rows.append({"비용 버킷": bucket.label, "금액": fmt_money(bucket.amount), "출처": humanize_source(bucket.source), "설명": bucket.description})
+    return rows
+
+
+def simulation_rows(result: QuickResult) -> list[dict[str, str]]:
+    simulation = result.simulation_result
+    return [
+        {"항목": "예상 총세대수", "값": f"{simulation.planned_households:,}세대", "출처": humanize_source(simulation.sources["households"])},
+        {"항목": "엔진 추정 총세대수", "값": f"{simulation.simulated_total_households:,}세대", "출처": humanize_source("simulation")},
+        {"항목": "일반분양 세대수", "값": f"{simulation.general_sale_households:,}세대", "출처": humanize_source(simulation.sources["general_sale_ratio"])},
+        {"항목": "임대주택 세대수", "값": f"{simulation.rental_households:,}세대", "출처": humanize_source(simulation.sources["rental_ratio"])},
+        {"항목": "기부채납 비율", "값": fmt_pct(simulation.donation_ratio), "출처": humanize_source(simulation.sources["donation_ratio"])},
+        {"항목": "대지면적", "값": f"{simulation.site_area_sqm:,.1f}㎡" if simulation.site_area_sqm is not None else "-", "출처": humanize_source(simulation.site_source)},
+    ]
+
+
+def feasibility_rows(result: QuickResult) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    tone_map = {"ok": "정상", "warn": "주의", "risk": "경고", "note": "참고"}
+    for item in result.feasibility_checks:
+        rows.append({"상태": tone_map.get(item.level, item.level), "점검항목": item.title, "설명": item.message})
     return rows
 
 
@@ -1683,14 +2114,36 @@ def summarize_document_state(parsed_notice: ParsedProjectNotice | None) -> list[
 def render_result_summary(result: QuickResult) -> None:
     if st is None:
         return
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("세후순이익", fmt_money(float(result.selected_exit["세후 순이익"])), f"ROI {fmt_pct(float(result.selected_exit['ROI']))}")
     c2.metric("추가투입금", fmt_money(result.additional_cash_needed), f"예상 {result.remaining_months / 12:.1f}년")
     c3.metric("시간비용", fmt_money(result.time_cost_to_exit), "보유비용 + 자금이자")
-    c4.metric("신뢰도", result.confidence_report.label, f"{result.confidence_report.total:.1f}점")
-    c5.metric("기준 비례율", fmt_plain_pct(result.project_summary["추정비례율"]), result.scenario_name)
+    c4.metric("손익분기 매수가", fmt_money(result.break_even_purchase_price), "세후 0원 기준")
+    c5.metric("권장 최대 매수가", fmt_money(result.max_bid_price), "안전마진 10%")
+    c6.metric("신뢰도", result.confidence_report.label, f"{result.confidence_report.total:.1f}점")
     for line in result.summary_lines:
         st.markdown(f"<div class='result-blurb'>{escape(line)}</div>", unsafe_allow_html=True)
+
+
+def render_input_guide(project_kind: ProjectKind) -> None:
+    if st is None:
+        return
+    kind_text = "재개발은 세입자·보상비까지 보수적으로 자동 반영합니다." if project_kind == ProjectKind.REDEVELOPMENT else "재건축은 주거이전비·영업손실보상비를 기본 제외하고 안전진단 비용만 조기 단계에 반영합니다."
+    st.markdown(
+        "<div class='section-card'>"
+        "<div class='soft-title'>입력 가이드</div>"
+        "<p class='mini-note'>일반분양 평균가는 준공 또는 분양 시점 기준의 예상 일반분양 평균가입니다. 현재 주변 실거래가와 같은 의미가 아닙니다.</p>"
+        "<p class='mini-note'>목표 용적률과 목표 건폐율을 같이 넣으면 총세대수와 평균층수를 자동 점검합니다. 목표 건폐율이 없으면 세대수 과다 경고는 약해집니다.</p>"
+        "<p class='mini-note'>기부채납 비율은 도로·공원·공공시설로 빠지는 면적을 묶어 반영한 간편값이며, 공식 토지이용계획이 있으면 그 값이 우선합니다.</p>"
+        "<p class='mini-note'>임대주택 비율은 공식 주택공급계획이 있으면 그 값이 우선하고, 없으면 사업유형과 프리셋으로 자동 추정합니다.</p>"
+        f"<p class='mini-note'>{escape(kind_text)}</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def default_unit_mix_text(current_exclusive_area: float, current_supply_area: float, current_households: int) -> str:
+    return f"기존대표형,{current_households},{current_exclusive_area:.1f},{current_supply_area:.1f}"
 
 
 def main() -> None:
@@ -1698,12 +2151,12 @@ def main() -> None:
         print("streamlit이 설치되지 않았습니다. `pip install streamlit` 후 `streamlit run app.py`로 실행해 주세요.")
         return
     inject_styles()
-    st.set_page_config(page_title="재건축 매물 즉시 수익성 계산기", layout="wide")
+    st.set_page_config(page_title="재건축/재개발 매물 즉시 수익성 계산기", layout="wide")
     st.markdown(
         """
         <div class="hero-card">
-            <h1>재건축 매물 즉시 수익성 계산기</h1>
-            <p>매물 검토에 필요한 핵심 수치만 먼저 넣고, 서울 공식값이나 문서가 있을 때만 정밀 계산을 더 열어보는 구조로 다시 구성했습니다.</p>
+            <h1>재건축/재개발 매물 즉시 수익성 계산기</h1>
+            <p>매물 검토에 필요한 핵심 수치만 먼저 넣고, 총세대수·일반분양·임대·기부채납은 자동 추정한 뒤 정밀 계산은 관리처분 이후에만 더 열어보는 구조로 구성했습니다.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1755,63 +2208,75 @@ def main() -> None:
 
     default_stage = normalize_stage_name(autofill_project.progress_stage) if autofill_project and normalize_stage_name(autofill_project.progress_stage) else "조합설립인가"
 
+    default_project_kind = autofill_project.project_kind if autofill_project and autofill_project.project_kind else ProjectKind.RECONSTRUCTION
     st.subheader("1. 빠른 입력")
+    project_kind_value = st.radio(
+        "사업유형",
+        [ProjectKind.RECONSTRUCTION.value, ProjectKind.REDEVELOPMENT.value],
+        index=0 if default_project_kind == ProjectKind.RECONSTRUCTION else 1,
+        horizontal=True,
+        help=FIELD_HELP["project_kind"],
+    )
+    project_kind = ProjectKind(project_kind_value)
+    render_input_guide(project_kind)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        purchase_price_eok = st.number_input("매수가(억)", min_value=0.0, value=35.0, step=0.1)
-        current_stage = st.selectbox("현재 사업단계", list(STAGE_BASE_MONTHS.keys()), index=list(STAGE_BASE_MONTHS.keys()).index(default_stage))
+        purchase_price_eok = st.number_input("매수가(억)", min_value=0.0, value=35.0, step=0.1, help=FIELD_HELP["purchase_price"])
+        current_stage = st.selectbox("현재 사업단계", list(STAGE_BASE_MONTHS.keys()), index=list(STAGE_BASE_MONTHS.keys()).index(default_stage), help=FIELD_HELP["current_stage"])
     with c2:
         current_unit_exclusive_area = st.number_input("현재 전용면적(㎡)", min_value=20.0, value=84.0, step=1.0)
         current_unit_supply_area = st.number_input("현재 공급면적(㎡)", min_value=20.0, value=107.7, step=1.0)
     with c3:
-        comparison_new_price_eok = st.number_input("비교 신축 시세(억)", min_value=0.0, value=48.0, step=0.1)
-        general_sale_price_eok = st.number_input("일반분양 평균가(억)", min_value=0.0, value=14.0, step=0.1)
+        comparison_new_price_eok = st.number_input("비교 신축 시세(억)", min_value=0.0, value=48.0, step=0.1, help=FIELD_HELP["comparison_new_price"])
+        general_sale_price_eok = st.number_input("일반분양 평균가(억)", min_value=0.0, value=14.0, step=0.1, help=FIELD_HELP["general_sale_price"])
     with c4:
-        floor_no = st.number_input("층수", min_value=1, value=10, step=1)
-        recent_trade_price_eok = st.number_input("최근 실거래 중앙값(억)", min_value=0.0, value=34.0, step=0.1)
-    st.caption("기본 답을 빨리 보려면 이 네 칸과 아래 최소 사업값만 채워도 됩니다.")
-
-    with st.expander("2. 프로젝트 기본값과 수동 보정", expanded=True):
-        st.caption("서울 공식값이 있으면 자동으로 채워지고, 없거나 틀린 부분만 덮어쓰면 됩니다.")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            current_households = st.number_input("기존 세대수", min_value=1, value=int(autofill_project.current_households or 480) if autofill_project else 480, step=1)
-            land_share = st.number_input("대지지분(㎡)", min_value=0.0, value=0.0, step=0.1)
-        with c2:
-            planned_households = st.number_input("예상 총세대수", min_value=1, value=int(autofill_project.planned_households or 620) if autofill_project and autofill_project.planned_households else 620, step=1)
-            current_far = st.number_input("현황 용적률(%)", min_value=0.0, value=180.0, step=1.0)
-        with c3:
-            target_far = st.number_input("목표 용적률(%)", min_value=0.0, value=float(autofill_project.target_far or 260.0) if autofill_project else 260.0, step=1.0)
-            public_price_eok = st.number_input("공동주택 공시가격(억)", min_value=0.0, value=25.0, step=0.1)
-        with c4:
-            building_coverage_ratio_pct = st.number_input("건폐율(%)", min_value=0.0, value=float(autofill_project.building_coverage_ratio or 0.0) if autofill_project else 0.0, step=1.0)
-            construction_cost_per_pyeong_man = st.number_input("공사비(만원/평)", min_value=0.0, value=900.0, step=10.0)
-        st.markdown(
-            f"{source_badge('대지지분을 모르면 비워두세요', 'warn')}{source_badge('서울 공식값이 있으면 우선 사용', 'ok')}{source_badge('없으면 용적률/건폐율로 자동추정', 'base')}",
-            unsafe_allow_html=True,
+        default_households = (
+            autofill_project.owner_count
+            if project_kind == ProjectKind.REDEVELOPMENT and autofill_project and autofill_project.owner_count
+            else autofill_project.current_households
+            if autofill_project and autofill_project.current_households
+            else 480
         )
+        current_households_label = "분양대상 권리자 수" if project_kind == ProjectKind.REDEVELOPMENT else "기존 세대수"
+        current_households = st.number_input(current_households_label, min_value=1, value=int(default_households), step=1, help=FIELD_HELP["current_households"])
+        construction_cost_per_pyeong_man = st.number_input("공사비(만원/평)", min_value=0.0, value=900.0, step=10.0, help=FIELD_HELP["construction_cost"])
+    st.caption("빠른 검토는 이 블록과 아래 사업 기본값만 채워도 바로 결과가 나옵니다.")
 
-    with st.expander("3. 어려운 가정값은 프리셋으로 시작", expanded=False):
+    with st.expander("2. 사업 기본값과 자동 추정", expanded=True):
+        st.caption("서울 공식값이 있으면 우선 사용하고, 없으면 입력값과 시뮬레이션으로 보완합니다.")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            current_far = st.number_input("현황 용적률(%)", min_value=0.0, value=180.0, step=1.0, help=FIELD_HELP["current_far"])
+            land_share = st.number_input("대지지분(㎡)", min_value=0.0, value=0.0, step=0.1, help=FIELD_HELP["land_share"])
+        with c2:
+            target_far = st.number_input("목표 용적률(%)", min_value=0.0, value=float(autofill_project.target_far or 260.0) if autofill_project else 260.0, step=1.0, help=FIELD_HELP["target_far"])
+            target_building_coverage_ratio_pct = st.number_input("목표 건폐율(%)", min_value=0.0, value=float(autofill_project.target_building_coverage_ratio or 0.0) if autofill_project else 0.0, step=1.0, help=FIELD_HELP["target_bcr"])
+        with c3:
+            current_building_coverage_ratio_pct = st.number_input("현황 건폐율(%)", min_value=0.0, value=0.0, step=1.0, help=FIELD_HELP["current_bcr"])
+            average_current_floors = st.number_input("기존 평균 층수", min_value=0.0, value=0.0, step=1.0, help=FIELD_HELP["avg_current_floors"])
+        with c4:
+            st.markdown(
+                f"{source_badge('대지지분을 모르면 비워두세요', 'warn')}{source_badge('서울 공식값이 있으면 우선 사용', 'ok')}{source_badge('없으면 용적률·건폐율로 자동추정', 'base')}",
+                unsafe_allow_html=True,
+            )
+
+    with st.expander("3. 자동 추정값 덮어쓰기와 금융 가정", expanded=False):
         preset = ASSUMPTION_PROFILES[assumption_profile]
-        st.caption("이 값들은 모를 때가 많아서 기본은 숨겨 두고, 수정이 필요할 때만 펼치도록 했습니다.")
+        st.caption("총세대수, 일반분양비율, 기부채납, 임대비율은 기본적으로 자동 산출됩니다. 분양계획이 명확할 때만 덮어쓰세요.")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            general_sale_ratio_pct = st.number_input("일반분양 비율(%)", min_value=0.0, max_value=50.0, value=preset["general_sale_ratio"] * 100, step=1.0)
+            target_households_override_value = st.number_input("예상 총세대수 직접수정", min_value=0, value=0, step=1, help=FIELD_HELP["target_households_override"])
+            general_sale_ratio_override_pct = st.number_input("일반분양 비율 직접수정(%)", min_value=0.0, max_value=60.0, value=0.0, step=1.0, help=FIELD_HELP["general_sale_ratio_override"])
         with c2:
-            donation_ratio_pct = st.number_input("기부채납 비율(%)", min_value=0.0, max_value=40.0, value=preset["donation_ratio"] * 100, step=1.0)
+            donation_ratio_override_pct = st.number_input("기부채납 비율 직접수정(%)", min_value=0.0, max_value=40.0, value=0.0, step=1.0, help=FIELD_HELP["donation_ratio_override"])
+            rental_ratio_override_pct = st.number_input("임대주택 비율 직접수정(%)", min_value=0.0, max_value=40.0, value=0.0, step=1.0, help=FIELD_HELP["rental_ratio_override"])
         with c3:
-            rental_ratio_pct = st.number_input("임대주택 비율(%)", min_value=0.0, max_value=40.0, value=preset["rental_ratio"] * 100, step=1.0)
+            sale_rate_pct = st.number_input("일반분양 판매율(%)", min_value=0.0, max_value=100.0, value=97.0, step=1.0, help=FIELD_HELP["sale_rate"])
+            cash_settlement_rate_pct = st.number_input("현금청산률(%)", min_value=0.0, max_value=100.0, value=3.0, step=1.0, help=FIELD_HELP["cash_settlement_rate"])
         with c4:
-            sale_rate_pct = st.number_input("일반분양 판매율(%)", min_value=0.0, max_value=100.0, value=97.0, step=1.0)
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            cash_settlement_rate_pct = st.number_input("현금청산률(%)", min_value=0.0, max_value=100.0, value=3.0, step=1.0)
-        with c2:
-            pf_rate_pct = st.number_input("PF 금리(%)", min_value=0.0, max_value=30.0, value=8.5, step=0.1)
-        with c3:
-            move_loan_rate_pct = st.number_input("이주비 금리(%)", min_value=0.0, max_value=20.0, value=5.0, step=0.1)
-        with c4:
-            delay_one_year = st.checkbox("일정 1년 지연 반영", value=False)
+            pf_rate_pct = st.number_input("PF 금리(%)", min_value=0.0, max_value=30.0, value=8.5, step=0.1, help=FIELD_HELP["pf_rate"])
+            move_loan_rate_pct = st.number_input("이주비 금리(%)", min_value=0.0, max_value=20.0, value=5.0, step=0.1, help=FIELD_HELP["move_loan_rate"])
+        delay_one_year = st.checkbox("일정 1년 지연 반영", value=False)
         capital_area = st.checkbox("수도권 프로젝트", value=True)
 
     detail_allowed = calc_mode == "정밀 계산" and is_advanced_detail_available(current_stage, merged_notice)
@@ -1821,17 +2286,33 @@ def main() -> None:
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             expected_new_exclusive_area = st.number_input("예상 새 전용면적(㎡)", min_value=0.0, value=84.0, step=1.0)
-            appraised_old_asset_eok = st.number_input("내 감정가/종전자산가액(억)", min_value=0.0, value=0.0, step=0.1)
+            official_price_label = "공동주택 공시가격 또는 감정가(억)" if project_kind == ProjectKind.RECONSTRUCTION else "토지/건물 공시가격 또는 감정가(억)"
+            official_price_help = FIELD_HELP["official_price_reconstruction"] if project_kind == ProjectKind.RECONSTRUCTION else FIELD_HELP["official_price_redevelopment"]
+            official_price_reference_eok = st.number_input(official_price_label, min_value=0.0, value=0.0, step=0.1, help=official_price_help)
         with c2:
+            appraised_old_asset_eok = st.number_input("내 감정가/종전자산가액(억)", min_value=0.0, value=0.0, step=0.1)
             total_old_asset_value_eok = st.number_input("단지 종전자산총액(억)", min_value=0.0, value=0.0, step=1.0)
-            adjustment_factor_override = st.number_input("보정계수 직접입력", min_value=0.0, value=0.0, step=0.01, format="%.2f")
         with c3:
+            adjustment_factor_override = st.number_input("보정계수 직접입력", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            floor_no = st.number_input("층수(정밀 참고)", min_value=1, value=10, step=1)
+        with c4:
+            recent_trade_price_eok = st.number_input("최근 실거래 중앙값(억)", min_value=0.0, value=0.0, step=0.1)
             acquisition_rate_pct = st.number_input("취득세 실효세율(%)", min_value=0.0, max_value=100.0, value=1.5, step=0.1)
             annual_holding_rate_pct = st.number_input("연 보유비용률(%)", min_value=0.0, max_value=100.0, value=0.3, step=0.1)
-        with c4:
             capital_gains_effective_rate_pct = st.number_input("양도세 실효세율(%)", min_value=0.0, max_value=100.0, value=20.0, step=0.5)
             brokerage_rate_pct = st.number_input("중개/처분비율(%)", min_value=0.0, max_value=100.0, value=0.4, step=0.1)
-        member_price_text = st.text_area("조합원 분양가표", value="59형,59,75.6,8.5\n84형,84,107.7,12.0\n101형,101,129.5,15.0", height=110)
+        unit_mix_text = st.text_area(
+            "기존 세대 타입별 분포(선택)",
+            value=default_unit_mix_text(current_unit_exclusive_area, current_unit_supply_area, int(current_households)) if project_kind == ProjectKind.RECONSTRUCTION else "",
+            height=90,
+            help=FIELD_HELP["unit_mix"],
+        )
+        member_price_text = st.text_area(
+            "조합원 분양가표(선택)",
+            value="59형,59,75.6,8.5\n84형,84,107.7,12.0\n101형,101,129.5,15.0",
+            height=110,
+            help=FIELD_HELP["member_price_text"],
+        )
 
     with st.expander("5. 상세 비용 버킷 직접입력", expanded=False):
         st.caption("비워두면 자동 계산값을 사용합니다. 숫자를 넣은 버킷만 직접입력값으로 덮어씁니다.")
@@ -1853,32 +2334,34 @@ def main() -> None:
             st.caption("문서 숫자는 자동 확정하지 않습니다. 체크한 값만 계산에 넣습니다.")
 
     quick_inputs = QuickDealInputs(
+        project_kind=project_kind,
         scenario_profile=assumption_profile,
         current_stage=current_stage,
         purchase_price=won_from_eok(purchase_price_eok),
         current_unit_exclusive_area=current_unit_exclusive_area,
         current_unit_supply_area=current_unit_supply_area,
-        floor_no=int(floor_no),
         comparison_new_price=won_from_eok(comparison_new_price_eok) if comparison_new_price_eok else None,
         general_sale_price=won_from_eok(general_sale_price_eok) if general_sale_price_eok else None,
         current_households=int(current_households),
-        planned_households=int(planned_households),
         current_far=current_far or None,
         target_far=target_far or None,
         land_share=land_share or None,
         site_area_sqm=autofill_project.site_area_sqm if autofill_project else None,
-        building_coverage_ratio=(building_coverage_ratio_pct / 100.0) if building_coverage_ratio_pct else None,
-        average_current_floors=None,
-        public_price=won_from_eok(public_price_eok) if public_price_eok else None,
+        current_building_coverage_ratio=(current_building_coverage_ratio_pct / 100.0) if current_building_coverage_ratio_pct else None,
+        target_building_coverage_ratio=(target_building_coverage_ratio_pct / 100.0) if target_building_coverage_ratio_pct else None,
+        average_current_floors=average_current_floors or None,
+        floor_no=int(floor_no),
+        official_price_reference=won_from_eok(official_price_reference_eok) if official_price_reference_eok else None,
         recent_same_complex_trade_price=won_from_eok(recent_trade_price_eok) if recent_trade_price_eok else None,
         sale_rate=sale_rate_pct / 100.0,
         cash_settlement_rate=cash_settlement_rate_pct / 100.0,
         construction_cost_per_pyeong=construction_cost_per_pyeong_man * 10_000,
         pf_rate=pf_rate_pct / 100.0,
         move_loan_rate=move_loan_rate_pct / 100.0,
-        general_sale_ratio=general_sale_ratio_pct / 100.0,
-        donation_ratio=donation_ratio_pct / 100.0,
-        rental_ratio=rental_ratio_pct / 100.0,
+        target_households_override=int(target_households_override_value) if target_households_override_value else None,
+        general_sale_ratio_override=(general_sale_ratio_override_pct / 100.0) if general_sale_ratio_override_pct else None,
+        donation_ratio_override=(donation_ratio_override_pct / 100.0) if donation_ratio_override_pct else None,
+        rental_ratio_override=(rental_ratio_override_pct / 100.0) if rental_ratio_override_pct else None,
         delay_one_year=delay_one_year,
         aggressive_upsize=aggressive_upsize,
         capital_area=capital_area,
@@ -1889,12 +2372,15 @@ def main() -> None:
         lookup_enabled=bool(autofill_project),
     )
     advanced_inputs = AdvancedProjectInputs(
-        expected_new_exclusive_area=expected_new_exclusive_area or None,
-        appraised_old_asset_value=won_from_eok(appraised_old_asset_eok) if appraised_old_asset_eok else None,
-        total_old_asset_value=won_from_eok(total_old_asset_value_eok) if total_old_asset_value_eok else None,
-        adjustment_factor_override=adjustment_factor_override or None,
-        total_market_value=None,
-        member_price_text=member_price_text,
+        rights_inputs=RightsInputs(
+            expected_new_exclusive_area=expected_new_exclusive_area or None,
+            appraised_old_asset_value=won_from_eok(appraised_old_asset_eok) if appraised_old_asset_eok else None,
+            total_old_asset_value=won_from_eok(total_old_asset_value_eok) if total_old_asset_value_eok else None,
+            official_price_reference=won_from_eok(official_price_reference_eok) if official_price_reference_eok else None,
+            adjustment_factor_override=adjustment_factor_override or None,
+            member_price_text=member_price_text,
+        ),
+        unit_mix_rows=parse_unit_mix_text(unit_mix_text),
         acquisition_rate=acquisition_rate_pct / 100.0,
         annual_holding_rate=annual_holding_rate_pct / 100.0,
         capital_gains_effective_rate=capital_gains_effective_rate_pct / 100.0,
@@ -1911,8 +2397,8 @@ def main() -> None:
     st.subheader("결과")
     if not quick_inputs.lookup_enabled:
         st.warning("서울 공식값을 못 불러온 상태라 일부 값은 수동 입력과 휴리스틱으로 계산됩니다.")
-    if focus_result.old_asset_source == "purchase_price_heuristic":
-        st.warning("공시가격, 실거래가, 감정가가 없어서 종전자산은 매수가 기반 휴리스틱으로 추정했습니다.")
+    if detail_allowed and focus_result.old_asset_source == "purchase_price_heuristic":
+        st.warning("정밀계산용 참고가격이 없어서 권리가액은 매수가 기반 휴리스틱으로 추정했습니다.")
     render_result_summary(focus_result)
 
     tab1, tab2, tab3 = st.tabs(["핵심 결과", "시나리오/민감도", "정밀 근거"])
@@ -1922,6 +2408,10 @@ def main() -> None:
         with left:
             render_table(project_summary_rows(focus_result), "사업성 요약")
         with right:
+            render_table(feasibility_rows(focus_result), "세대수/층수 점검")
+        render_table(simulation_rows(focus_result), "자동 추정과 공식값 반영")
+        left, right = st.columns([1.1, 0.9])
+        with left:
             if detail_allowed and focus_result.allocation_options:
                 render_table(allocation_rows(focus_result), "배정평형 추천")
             else:
@@ -1929,15 +2419,16 @@ def main() -> None:
                     "<div class='section-card'><div class='soft-title'>배정평형 추천</div><p class='mini-note'>관리처분인가 이후 단계이거나 관련 문서가 있을 때 더 신뢰도 있게 보여줍니다. 지금은 빠른 검토 중심입니다.</p></div>",
                     unsafe_allow_html=True,
                 )
-        assumption_rows = [
-            {"가정값": "일반분양 판매율", "값": fmt_pct(focus_result.assumption_summary["sale_rate"])},
-            {"가정값": "현금청산률", "값": fmt_pct(focus_result.assumption_summary["cash_settlement_rate"])},
-            {"가정값": "기부채납 비율", "값": fmt_pct(focus_result.assumption_summary["donation_ratio"])},
-            {"가정값": "임대주택 비율", "값": fmt_pct(focus_result.assumption_summary["rental_ratio"])},
-            {"가정값": "일반분양 비율", "값": fmt_pct(focus_result.assumption_summary["general_sale_ratio"])},
-            {"가정값": "PF 금리", "값": fmt_pct(focus_result.assumption_summary["pf_rate"])},
-        ]
-        render_table(assumption_rows, "이번 계산에 들어간 핵심 가정")
+        with right:
+            assumption_rows = [
+                {"가정값": "일반분양 판매율", "값": fmt_pct(focus_result.assumption_summary["sale_rate"])},
+                {"가정값": "현금청산률", "값": fmt_pct(focus_result.assumption_summary["cash_settlement_rate"])},
+                {"가정값": "기부채납 비율", "값": fmt_pct(focus_result.assumption_summary["donation_ratio"])},
+                {"가정값": "임대주택 비율", "값": fmt_pct(focus_result.assumption_summary["rental_ratio"])},
+                {"가정값": "일반분양 비율", "값": fmt_pct(focus_result.assumption_summary["general_sale_ratio"])},
+                {"가정값": "PF 금리", "값": fmt_pct(focus_result.assumption_summary["pf_rate"])},
+            ]
+            render_table(assumption_rows, "이번 계산에 들어간 핵심 가정")
 
     with tab2:
         render_table(exit_rows(focus_result), "엑시트별 손익")
@@ -1945,12 +2436,12 @@ def main() -> None:
 
     with tab3:
         render_table(bucket_rows(focus_result), "비용 버킷")
-        if detail_allowed:
+        if detail_allowed and focus_result.advanced_rights_result is not None:
             detail_rows = [
-                {"항목": "종전자산 추정액", "값": fmt_money(focus_result.old_asset_estimate), "출처": humanize_source(focus_result.old_asset_source or "")},
-                {"항목": "단지 종전자산총액", "값": fmt_money(focus_result.total_old_asset_value), "출처": humanize_source(focus_result.total_old_asset_source or "")},
-                {"항목": "권리가액", "값": fmt_money(focus_result.rights_value), "출처": "계산 엔진"},
-                {"항목": "보정계수", "값": f"{focus_result.adjustment_factor:.3f}" if focus_result.adjustment_factor is not None else "-", "출처": humanize_source("engine")},
+                {"항목": "종전자산 추정액", "값": fmt_money(focus_result.advanced_rights_result.old_asset_estimate), "출처": humanize_source(focus_result.advanced_rights_result.old_asset_source)},
+                {"항목": "단지 종전자산총액", "값": fmt_money(focus_result.advanced_rights_result.total_old_asset_value), "출처": humanize_source(focus_result.advanced_rights_result.total_old_asset_source)},
+                {"항목": "권리가액", "값": fmt_money(focus_result.advanced_rights_result.rights_value), "출처": "계산 엔진"},
+                {"항목": "보정계수", "값": f"{focus_result.advanced_rights_result.adjustment_factor:.3f}", "출처": humanize_source("engine")},
             ]
             render_table(detail_rows, "정밀 계산 정보")
         render_source_records(focus_result.source_records, "계산 근거")
