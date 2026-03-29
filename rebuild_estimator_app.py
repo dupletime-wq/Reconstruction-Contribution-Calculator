@@ -6,6 +6,7 @@ from enum import Enum
 from html import escape, unescape
 from html.parser import HTMLParser
 from io import BytesIO, StringIO
+import json
 import re
 import statistics
 from typing import Generic, Protocol, TypeVar
@@ -170,6 +171,7 @@ SOURCE_LABELS: dict[str, str] = {
     "engine": "계산 엔진",
     "official_cleanup": "서울 정비사업 정보몽땅",
     "naver_land": "네이버 부동산 공개 페이지",
+    "naver_land_heuristic": "네이버 단지정보 기반 부지면적 추정",
     "kgeop_public": "KGeoP 공개 지도",
     "manual": "직접 입력",
     "document": "업로드 문서",
@@ -359,6 +361,8 @@ class AutofillProjectData:
     site_area_sqm: float | None = None
     building_area_sqm: float | None = None
     gross_floor_area_sqm: float | None = None
+    average_current_floors: float | None = None
+    current_building_count: int | None = None
     target_building_coverage_ratio: float | None = None
     current_building_coverage_ratio: float | None = None
     target_far: float | None = None
@@ -922,6 +926,23 @@ def estimate_exclusive_area_from_supply_area(
     supply = max(float(supply_area_sqm), 1.0)
     ratios = [1.27, 1.25] if project_kind == ProjectKind.REDEVELOPMENT or reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER else [1.30, 1.27, 1.23]
     return round(statistics.mean(supply / ratio for ratio in ratios), 2)
+
+
+def heuristic_current_building_coverage_ratio(avg_floors: float, building_count: int | None = None) -> float:
+    floors = max(float(avg_floors), 1.0)
+    if floors <= 6:
+        ratio = 0.20
+    elif floors <= 10:
+        ratio = 0.18
+    elif floors <= 15:
+        ratio = 0.16
+    else:
+        ratio = 0.14
+    if building_count and building_count >= 10:
+        ratio += 0.01
+    elif building_count and building_count <= 3:
+        ratio -= 0.01
+    return clamp(ratio, 0.12, 0.24)
 
 
 def default_member_price_table(
@@ -2167,6 +2188,100 @@ def parse_naver_search_links(html_text: str) -> list[SearchResult]:
     return results
 
 
+def naver_parse_area_pair(item: dict[str, object]) -> tuple[float | None, float | None]:
+    for key in ("kbTendency", "kabTendency"):
+        raw = str(item.get(key) or "")
+        parts = [part for part in raw.split("^") if part]
+        if len(parts) >= 2:
+            supply = parse_float(parts[0])
+            exclusive = parse_float(parts[1])
+            if supply and exclusive:
+                return supply, exclusive
+    size_range = str(item.get("sizeRangeDisplay") or item.get("size") or "")
+    if "~" in size_range:
+        supply = parse_float(size_range.split("~", 1)[0])
+        if supply:
+            return supply, estimate_exclusive_area_from_supply_area(supply)
+    supply = parse_float(size_range)
+    if supply:
+        return supply, estimate_exclusive_area_from_supply_area(supply)
+    return None, None
+
+
+def naver_mobile_search_complexes(query: str) -> list[dict[str, object]]:
+    keyword = query.strip()
+    if not keyword:
+        return []
+    url = f"https://m.land.naver.com/search/moreList?q={urllib.parse.quote(keyword)}&page=1"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.6",
+            "Referer": f"https://m.land.naver.com/search?query={urllib.parse.quote(keyword)}",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8", "ignore"))
+    result = payload.get("result") or {}
+    complexes = result.get("complexList") or []
+    return [item for item in complexes if isinstance(item, dict)]
+
+
+def naver_project_id_from_item(item: dict[str, object], query: str) -> str:
+    hscp_no = str(item.get("hscpNo") or item.get("complexCode") or "").strip()
+    complex_name = str(item.get("complexName") or item.get("hscpNm") or query).strip()
+    return urllib.parse.urlencode({"hscpNo": hscp_no, "name": complex_name, "query": query}, doseq=False)
+
+
+def naver_build_project_from_item(item: dict[str, object], query: str) -> AutofillProjectData:
+    project_name = str(item.get("complexName") or item.get("hscpNm") or query).strip()
+    supply_area_sqm, exclusive_area_sqm = naver_parse_area_pair(item)
+    households = parse_int(str(item.get("householdNumber") or ""))
+    floor_number = parse_float(str(item.get("floorNumber") or ""))
+    project = AutofillProjectData(
+        query=query,
+        project_name=project_name,
+        district=str(item.get("dvsnName") or item.get("dvsnNm") or "").strip(),
+        business_type=str(item.get("complexTypeName") or "").strip(),
+        project_kind=guess_project_kind(str(item.get("complexTypeName") or "")) if item.get("complexTypeName") else None,
+        progress_stage=None,
+        representative_lot=str(item.get("addressMobile") or item.get("address") or "").strip(),
+        source_url=urllib.parse.urljoin("https://m.land.naver.com", str(item.get("url") or f"/search/result/{urllib.parse.quote(project_name)}")),
+        search_source="naver_land",
+        current_households=households,
+        average_current_floors=floor_number,
+        current_building_count=parse_int(str(item.get("buildingNumber") or "")),
+    )
+    project.external_links.append(("네이버 부동산 모바일 검색", f"https://m.land.naver.com/search/result/{urllib.parse.quote(project_name)}"))
+    if project.source_url:
+        project.external_links.append(("네이버 부동산 단지 링크", project.source_url))
+    kgeop_keyword = project.representative_lot or f"{project.district} {project_name}".strip()
+    if kgeop_keyword:
+        project.external_links.append(("KGeoP 주소/필지 검색", f"https://kgeop.go.kr/cmm/unitySearch/getUnitySearchList.do?searchKeyword={urllib.parse.quote(kgeop_keyword)}"))
+    if households is not None:
+        attach_observed(project, "current_households", households, "naver_land", 0.76)
+        project.source_records.append(record("current_households", str(households), "naver_land", 0.76))
+    if floor_number is not None:
+        attach_observed(project, "average_current_floors", floor_number, "naver_land", 0.58)
+        project.source_records.append(record("avg_current_floors", f"{floor_number:.1f}", "naver_land", 0.52))
+    if project.current_building_count is not None:
+        project.source_records.append(record("building_count", str(project.current_building_count), "naver_land", 0.46))
+    if supply_area_sqm or exclusive_area_sqm:
+        supply = supply_area_sqm or estimate_supply_area_from_exclusive_area(exclusive_area_sqm or 84.0)
+        exclusive = exclusive_area_sqm or estimate_exclusive_area_from_supply_area(supply)
+        seed_households = households or 1
+        label = infer_unit_mix_label(exclusive)
+        project.existing_unit_mix_rows = [UnitMixRow(label=label, households=seed_households, exclusive_area_sqm=exclusive, supply_area_sqm=supply)]
+        project.unit_mix_source = "naver_land"
+        project.unit_mix_confidence = 0.62
+    sync_project_capability(project, "external_structured")
+    add_source_health(project, "naver_land", "partial", "네이버 모바일 검색 결과에서 단지 기본정보를 구조화했습니다.")
+    return project
+
+
 def naver_extract_metric(tokens: list[str], key: str, suffix: str = "") -> str | None:
     for idx, token in enumerate(tokens[:-1]):
         compact = re.sub(r"\s+", "", token)
@@ -2183,14 +2298,39 @@ def naver_search_projects(query: str) -> list[SearchResult]:
     keyword = query.strip()
     if not keyword:
         return []
-    url = f"https://fin.land.naver.com/search?q={urllib.parse.quote(keyword)}"
+    try:
+        complexes = naver_mobile_search_complexes(keyword)
+    except Exception:
+        complexes = []
+    if complexes:
+        results: list[SearchResult] = []
+        for item in complexes[:8]:
+            project = naver_build_project_from_item(item, keyword)
+            subtitle_parts = [project.district, project.business_type]
+            if project.current_households:
+                subtitle_parts.append(f"{project.current_households}세대")
+            results.append(
+                SearchResult(
+                    source="naver_land",
+                    project_id=naver_project_id_from_item(item, keyword),
+                    title=project.project_name or keyword,
+                    subtitle=" / ".join(part for part in subtitle_parts if part) or "네이버 부동산 모바일 검색 결과",
+                    url=project.source_url,
+                    confidence=0.66,
+                    capability="external_structured",
+                    structured_fields_count=count_structured_project_fields(project) + (1 if project.existing_unit_mix_rows else 0),
+                    status_reason="네이버 모바일 검색 결과 기반 단지 기본정보",
+                )
+            )
+        return results
+    url = f"https://m.land.naver.com/search/result/{urllib.parse.quote(keyword)}"
     try:
         html_text = fetch_html(url)
+        results = parse_naver_search_links(html_text)
+        if results:
+            return results[:8]
     except urllib.error.URLError:
-        return []
-    results = parse_naver_search_links(html_text)
-    if results:
-        return results[:8]
+        pass
     return [
         SearchResult(
             source="naver_land",
@@ -2209,6 +2349,19 @@ def naver_search_projects(query: str) -> list[SearchResult]:
 def naver_fetch_project_summary(project_id: str) -> AutofillProjectData | None:
     if not project_id:
         return None
+    if "=" in project_id and "&" in project_id:
+        params = urllib.parse.parse_qs(project_id)
+        hscp_no = (params.get("hscpNo") or [""])[0]
+        query = (params.get("query") or params.get("name") or [""])[0]
+        try:
+            complexes = naver_mobile_search_complexes(query)
+        except Exception:
+            complexes = []
+        for item in complexes:
+            candidate_hscp = str(item.get("hscpNo") or item.get("complexCode") or "").strip()
+            if hscp_no and candidate_hscp != hscp_no:
+                continue
+            return naver_build_project_from_item(item, query)
     try:
         html_text = fetch_html(project_id)
     except urllib.error.URLError:
@@ -2267,17 +2420,17 @@ def kgeop_search_projects(query: str) -> list[SearchResult]:
     keyword = query.strip()
     if not keyword:
         return []
-    url = "https://kgeop.go.kr/info/infoMap.do?initMode=L"
+    url = f"https://kgeop.go.kr/cmm/unitySearch/getUnitySearchList.do?searchKeyword={urllib.parse.quote(keyword)}"
     return [
         SearchResult(
             source="kgeop_public",
             project_id=url,
             title=f"{keyword} KGeoP 공개 지도",
-            subtitle="필지/지목/위치 정합성 확인용 보조 링크",
+            subtitle="주소/필지/위치 정합성 확인용 KGeoP 검색 링크",
             url=url,
             confidence=0.12,
             capability="external_link_only",
-            status_reason="공개 지도 링크만 제공합니다.",
+            status_reason="대지지분 직접 추출은 아직 지원하지 않고 KGeoP 검색 링크를 제공합니다.",
         )
     ]
 
@@ -2456,6 +2609,16 @@ def estimate_site_area(inputs: QuickDealInputs, current_gross_floor_area_sqm: fl
         return current_gross_floor_area_sqm / max(inputs.current_far / 100.0, 0.01), "simulation"
     if inputs.current_building_coverage_ratio and inputs.average_current_floors:
         return current_gross_floor_area_sqm / max(inputs.current_building_coverage_ratio * inputs.average_current_floors, 0.01), "simulation"
+    project = inputs.autofill_project
+    if (
+        project
+        and project.search_source == "naver_land"
+        and project.average_current_floors
+        and current_gross_floor_area_sqm > 0
+    ):
+        heuristic_bcr = heuristic_current_building_coverage_ratio(project.average_current_floors, project.current_building_count)
+        estimated_site_area = current_gross_floor_area_sqm / max(project.average_current_floors * heuristic_bcr, 0.01)
+        return estimated_site_area, "naver_land_heuristic"
     return None, "simulation"
 
 
@@ -3293,6 +3456,7 @@ def render_project_autofill(project: AutofillProjectData | None) -> None:
         f"<p class='mini-note'>대표지번: {escape(project.representative_lot or '-')} / 조합원·권리자 수: {project.current_households or project.owner_count or '-'} / 계획 세대수: {project.planned_households or '-'}</p>"
         f"<p class='mini-note'>목표 건폐율: {project.target_building_coverage_ratio or '-'}% / 목표 용적률: {project.target_far or '-'}% / 분양주택: {project.sale_households_total or '-'}세대 / 추정 일반분양: {project.sale_households or '-'}세대 / 임대: {project.rental_households or '-'}세대</p>"
         f"<p class='mini-note'>공공시설 반영면적: {project.public_facility_area_sqm or '-'}㎡ / 명시 기부채납: {project.donation_area_sqm or '-'}㎡ / 출처: {humanize_source(project.search_source)}</p>"
+        f"<p class='mini-note'>평균 층수 후보: {project.average_current_floors or '-'}층 / 동수 후보: {project.current_building_count or '-'}개동</p>"
         f"<p class='mini-note'>세대구성 후보: {len(project.existing_unit_mix_rows) or len(project.planned_unit_mix_candidates)}건 / 반영 출처: {humanize_source(project.unit_mix_source)}</p>"
         + (f"<div class='mini-note' style='margin-top:8px;'><strong>외부 확인 링크</strong><ul style='margin:6px 0 0 18px;'>{external_links}</ul></div>" if external_links else "")
         + "</div>"
@@ -3659,6 +3823,11 @@ def main() -> None:
         st.caption("단독주택 묶음형 재건축은 아파트 평형보다 대지지분과 권리자 수가 더 중요해서, 입력 화면과 정산액 로직을 토지형으로 전환합니다.")
     redevelopment_base_exclusive_area = 59.0
     redevelopment_base_supply_area = 75.6
+    autofill_exclusive_default = 84.0
+    autofill_supply_default = 107.7
+    if autofill_project and autofill_project.existing_unit_mix_rows:
+        autofill_exclusive_default = weighted_average_exclusive_area(autofill_project.existing_unit_mix_rows, 84.0)
+        autofill_supply_default = weighted_average_supply_area(autofill_project.existing_unit_mix_rows, 107.7)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         purchase_price_eok = st.number_input("매수가(억)", min_value=0.0, value=35.0, step=0.1, help=FIELD_HELP["purchase_price"])
@@ -3683,8 +3852,8 @@ def main() -> None:
             )
             st.caption("재개발은 이 칸보다 대지지분과 권리자 수 입력이 훨씬 중요합니다.")
         else:
-            current_unit_exclusive_area = st.number_input("현재 전용면적(㎡)", min_value=20.0, value=84.0, step=1.0)
-            current_unit_supply_area = st.number_input("현재 공급면적(㎡)", min_value=20.0, value=107.7, step=1.0)
+            current_unit_exclusive_area = st.number_input("현재 전용면적(㎡)", min_value=20.0, value=float(round(autofill_exclusive_default, 1)), step=1.0)
+            current_unit_supply_area = st.number_input("현재 공급면적(㎡)", min_value=20.0, value=float(round(autofill_supply_default, 1)), step=1.0)
     if land_based_reconstruction:
         st.caption("단독주택 묶음형 재건축은 현재 평형 대신 비교 기준 평형 59㎡/75.6㎡ 자동값을 사용합니다.")
     with c3:
@@ -3728,7 +3897,13 @@ def main() -> None:
             target_building_coverage_ratio_pct = st.number_input("목표 건폐율(%)", min_value=0.0, value=float(autofill_project.target_building_coverage_ratio or 0.0) if autofill_project else 0.0, step=1.0, help=FIELD_HELP["target_bcr"])
         with c3:
             current_building_coverage_ratio_pct = st.number_input("현황 건폐율(%)", min_value=0.0, value=0.0, step=1.0, help=FIELD_HELP["current_bcr"])
-            average_current_floors = st.number_input("기존 평균 층수", min_value=0.0, value=0.0, step=1.0, help=FIELD_HELP["avg_current_floors"])
+            average_current_floors = st.number_input(
+                "기존 평균 층수",
+                min_value=0.0,
+                value=float(autofill_project.average_current_floors or 0.0) if autofill_project else 0.0,
+                step=1.0,
+                help=FIELD_HELP["avg_current_floors"],
+            )
         with c4:
             st.markdown(
                 f"{source_badge('대지지분을 모르면 비워두세요', 'warn')}{source_badge('서울 공식값이 있으면 우선 사용', 'ok')}{source_badge('없으면 용적률·건폐율로 자동추정', 'base')}",
