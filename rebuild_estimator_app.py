@@ -173,6 +173,7 @@ SOURCE_LABELS: dict[str, str] = {
     "naver_land": "네이버 부동산 공개 페이지",
     "naver_land_heuristic": "네이버 단지정보 기반 부지면적 추정",
     "kgeop_public": "KGeoP 공개 지도",
+    "eum_public": "토지이음 공개 열람",
     "manual": "직접 입력",
     "document": "업로드 문서",
     "preset": "기본 프리셋",
@@ -187,6 +188,9 @@ VALUE_LABELS: dict[str, str] = {
     "unsupported": "지원하지 않는 파일",
     "parse_error": "파싱 실패",
 }
+
+KGEOP_MAP_URL = "https://kgeop.go.kr/info/infoMap.do?initMode=L"
+
 
 COST_BUCKET_META: tuple[tuple[str, str, str], ...] = (
     ("main_construction", "본공사", "연면적과 공사비 단가 기반"),
@@ -335,6 +339,14 @@ class SourceHealth:
     reason: str = ""
 
 
+@dataclass
+class LandUseLimitRow:
+    code: str
+    name: str
+    max_building_coverage_ratio_pct: float | None = None
+    max_far_pct: float | None = None
+
+
 class SearchAdapter(Protocol):
     def search(self, query: str) -> list[SearchResult]:
         ...
@@ -357,10 +369,15 @@ class AutofillProjectData:
     project_slug: str = ""
     cafe_id: str = ""
     source_url: str = ""
+    pnu: str = ""
+    road_address: str = ""
+    land_category: str = ""
     official_area_sqm: float | None = None
     site_area_sqm: float | None = None
     building_area_sqm: float | None = None
     gross_floor_area_sqm: float | None = None
+    official_land_price_per_sqm: float | None = None
+    current_far: float | None = None
     average_current_floors: float | None = None
     current_building_count: int | None = None
     target_building_coverage_ratio: float | None = None
@@ -388,6 +405,11 @@ class AutofillProjectData:
     planned_unit_mix_candidates: list["UnitMixRow"] = field(default_factory=list)
     unit_mix_source: str = "simulation"
     unit_mix_confidence: float = 0.0
+    eum_allowed_far_max: float | None = None
+    eum_allowed_bcr_max: float | None = None
+    eum_zone_names: list[str] = field(default_factory=list)
+    eum_designation_names: list[str] = field(default_factory=list)
+    land_use_limit_rows: list[LandUseLimitRow] = field(default_factory=list)
     source_health: list[SourceHealth] = field(default_factory=list)
 
 
@@ -603,8 +625,16 @@ def count_structured_project_fields(project: AutofillProjectData | None) -> int:
         return 0
     fields = (
         project.site_area_sqm,
+        project.building_area_sqm,
+        project.gross_floor_area_sqm,
+        project.official_land_price_per_sqm,
+        project.current_far,
+        project.current_building_coverage_ratio,
+        project.average_current_floors,
         project.target_building_coverage_ratio,
         project.target_far,
+        project.eum_allowed_bcr_max,
+        project.eum_allowed_far_max,
         project.current_households,
         project.owner_count,
         project.planned_households,
@@ -657,8 +687,8 @@ def choose_observed_value(
         "manual": 6,
         "document": 5,
         "official_cleanup": 4,
-        "naver_land": 3,
-        "kgeop_public": 2,
+        "kgeop_public": 3,
+        "naver_land": 2,
         "simulation": 1,
         "engine": 0,
     }
@@ -836,6 +866,17 @@ def parse_int(text: str | None) -> int | None:
     if parsed is None:
         return None
     return int(round(parsed))
+
+
+def normalize_lookup_text(text: str | None) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", "", str(text or "").lower())
+
+
+def extract_district_name(address: str | None) -> str:
+    tokens = [token for token in str(address or "").split() if token]
+    if len(tokens) >= 2 and any(tokens[0].endswith(suffix) for suffix in ("시", "도", "특별시", "광역시", "특별자치시", "특별자치도")):
+        return tokens[1]
+    return tokens[0] if tokens else ""
 
 
 def parse_korean_money(text: str) -> float | None:
@@ -1842,6 +1883,22 @@ def fetch_html(url: str) -> str:
         return response.read().decode("utf-8", "ignore")
 
 
+def fetch_text(url: str, *, encoding: str = "utf-8", data: bytes | None = None, headers: dict[str, str] | None = None) -> str:
+    request_headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5",
+    }
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, data=data, headers=request_headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read().decode(encoding, "ignore")
+
+
+def fetch_json(url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None) -> dict[str, object]:
+    return json.loads(fetch_text(url, encoding="utf-8", data=data, headers=headers))
+
+
 @cache_data(ttl=60 * 60, show_spinner=False)
 def cleanup_search_projects(query: str) -> list[AutofillProjectData]:
     keyword = query.strip()
@@ -2493,7 +2550,7 @@ def merge_autofill_projects(*projects: AutofillProjectData | None) -> AutofillPr
     for field_name, observed_value in base.observed_fields.items():
         try:
             current_value = getattr(base, field_name, None)
-            source_rank = {"manual": 6, "document": 5, "official_cleanup": 4, "external_structured": 3, "naver_land": 2, "kgeop_public": 1, "simulation": 0}
+            source_rank = {"manual": 6, "document": 5, "official_cleanup": 4, "external_structured": 3, "kgeop_public": 2, "naver_land": 1, "simulation": 0}
             current_source = ""
             if field_name in base.field_candidates and base.field_candidates[field_name]:
                 current_source = max(base.field_candidates[field_name], key=lambda item: (source_rank.get(item.source, 0), item.confidence)).source
