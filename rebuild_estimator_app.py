@@ -78,11 +78,23 @@ REDEVELOPMENT_PROFILE_FLOORS = {
 }
 
 STAGE_BASE_MONTHS: dict[str, int] = {
+    "재건축진단": 156,
+    "정비구역지정": 132,
+    "추진위승인": 108,
+    "조합설립인가": 96,
+    "사업시행인가": 72,
+    "관리처분인가": 48,
+    "이주/철거": 30,
+    "착공": 24,
+    "준공/입주": 0,
+}
+
+STAGE_SCHEDULE_FLOORS: dict[str, int] = {
     "재건축진단": 120,
-    "정비구역지정": 96,
+    "정비구역지정": 102,
     "추진위승인": 84,
     "조합설립인가": 72,
-    "사업시행인가": 48,
+    "사업시행인가": 54,
     "관리처분인가": 36,
     "이주/철거": 24,
     "착공": 18,
@@ -136,6 +148,7 @@ DISPLAY_KEY_LABELS: dict[str, str] = {
     "sale_households_total": "분양주택 세대수",
     "rental_households": "임대주택 세대수",
     "donation_area_sqm": "명시 기부채납 면적",
+    "planned_unit_mix_source": "준공 후 공급 평형 계획",
     "pf_financing_ratio": "PF 조달비율",
     "pf_interest_months": "PF 이자 반영개월",
     "avg_move_loan_amount": "세대당 평균 이주비",
@@ -218,6 +231,7 @@ FIELD_HELP: dict[str, str] = {
     "official_price_reconstruction": "재건축 정밀계산에서만 쓰는 참고값입니다. 공동주택 공시가격이나 감정가가 있으면 권리가액 추정 보정에 사용합니다.",
     "official_price_redevelopment": "재개발 정밀계산에서만 쓰는 참고값입니다. 토지/건물 공시가격 또는 감정가를 넣으면 권리가액 참고 추정에 사용합니다.",
     "unit_mix": "재건축에서 기존 평형별 세대수와 면적을 넣으면 현재 연면적과 세대구성을 더 정확하게 추정합니다. 형식: 타입,세대수,전용,공급",
+    "planned_unit_mix": "준공 후 공급할 평형 계획입니다. 형식: 타입,세대수,전용,공급. 비워두면 59/74/84/101/114 중심 자동안을 사용하고, 넣으면 총세대수와 분양수입 계산에 이 값이 우선 반영됩니다.",
     "member_price_text": "정밀모드에서 배정평형 비교가 필요할 때만 쓰는 참고값입니다. 빠른 수익성 답에는 필수가 아닙니다. 형식: 타입,전용,공급,분양가(억)",
 }
 
@@ -426,6 +440,7 @@ class AdvancedProjectInputs:
     other_disposal_revenue: float
     liquidation_cost_override: float | None
     cost_bucket_overrides: dict[str, float]
+    planned_unit_mix_rows: list[UnitMixRow] = field(default_factory=list)
 
 
 @dataclass
@@ -515,6 +530,8 @@ class QuickResult:
     allocation_options: list[dict[str, float | str]] = field(default_factory=list)
     scenario_delta_summary: str = ""
     scenario_visibility: bool = True
+    planned_unit_mix_rows: list[UnitMixRow] = field(default_factory=list)
+    planned_unit_mix_source: str = "simulation"
 
 
 def cache_data(*args, **kwargs):
@@ -815,6 +832,7 @@ def default_member_price_table(
     current_exclusive_area: float,
     expected_new_area: float | None,
     member_sale_price_ratio: float,
+    planned_unit_mix_rows: list[UnitMixRow] | None = None,
 ) -> list[MemberPriceRecord]:
     text_table = parse_member_price_text(user_text)
     if text_table:
@@ -822,10 +840,12 @@ def default_member_price_table(
     if use_doc_table and doc_table:
         return doc_table
     base_exclusive = expected_new_area or max(current_exclusive_area, 59.0)
-    if project_kind == ProjectKind.REDEVELOPMENT or reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER:
+    if planned_unit_mix_rows:
+        sizes = sorted({float(round(item.exclusive_area_sqm)) for item in planned_unit_mix_rows if item.exclusive_area_sqm > 0})
+    elif project_kind == ProjectKind.REDEVELOPMENT or reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER:
         sizes = sorted({59.0, 74.0, 84.0, round(base_exclusive)})
     else:
-        sizes = sorted({59.0, 84.0, 101.0, round(base_exclusive)})
+        sizes = sorted({59.0, 84.0, 101.0, 114.0, round(base_exclusive)})
     rows: list[MemberPriceRecord] = []
     for size in sizes:
         supply_area = round(size / 0.78, 2)
@@ -938,6 +958,138 @@ def weighted_average_supply_area(unit_mix_rows: list[UnitMixRow], default_supply
     return safe_div(weighted_area, total_households, default_supply_area)
 
 
+def allocate_counts_by_weights(total_count: int, weights: list[float]) -> list[int]:
+    if total_count <= 0 or not weights:
+        return [0 for _ in weights]
+    positive_weights = [max(weight, 0.0) for weight in weights]
+    weight_sum = sum(positive_weights)
+    if weight_sum <= 0:
+        positive_weights = [1.0 for _ in weights]
+        weight_sum = float(len(weights))
+    raw_values = [total_count * (weight / weight_sum) for weight in positive_weights]
+    floors = [int(value) for value in raw_values]
+    remainder = total_count - sum(floors)
+    remainders = sorted(
+        enumerate([value - int(value) for value in raw_values]),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    for index, _ in remainders[:remainder]:
+        floors[index] += 1
+    return floors
+
+
+def auto_planned_unit_mix_rows(
+    quick_inputs: QuickDealInputs,
+    unit_mix_rows: list[UnitMixRow],
+    planned_households: int,
+) -> list[UnitMixRow]:
+    if planned_households <= 0:
+        return []
+    average_exclusive = weighted_average_exclusive_area(unit_mix_rows, quick_inputs.current_unit_exclusive_area)
+    if uses_land_based_flow(quick_inputs):
+        sizes = [59.0, 74.0, 84.0]
+    elif average_exclusive >= 100:
+        sizes = [59.0, 84.0, 101.0, 114.0]
+    elif average_exclusive >= 84:
+        sizes = [59.0, 74.0, 84.0, 101.0]
+    else:
+        sizes = [59.0, 74.0, 84.0]
+
+    if unit_mix_rows and uses_apartment_reconstruction_flow(quick_inputs):
+        total_households = max(sum(item.households for item in unit_mix_rows), 1)
+        small_share = sum(item.households for item in unit_mix_rows if item.exclusive_area_sqm <= 60.0) / total_households
+        large_share = sum(item.households for item in unit_mix_rows if item.exclusive_area_sqm >= 100.0) / total_households
+        if len(sizes) == 4:
+            mid_share = max(1.0 - small_share - large_share, 0.0)
+            weights = [
+                max(small_share, 0.18),
+                max(mid_share * 0.30, 0.12),
+                max(mid_share * 0.45, 0.20),
+                max(large_share, 0.10),
+            ]
+        else:
+            mid_share = max(1.0 - small_share, 0.0)
+            weights = [max(small_share, 0.25), max(mid_share * 0.35, 0.18), max(mid_share * 0.45, 0.22)]
+    else:
+        if len(sizes) == 4:
+            if average_exclusive >= 100:
+                weights = [0.14, 0.18, 0.34, 0.34]
+            elif average_exclusive >= 84:
+                weights = [0.22, 0.18, 0.40, 0.20]
+            else:
+                weights = [0.42, 0.18, 0.26, 0.14]
+        else:
+            if uses_land_based_flow(quick_inputs):
+                weights = [0.34, 0.22, 0.44]
+            elif average_exclusive <= 65:
+                weights = [0.55, 0.20, 0.25]
+            elif average_exclusive <= 84:
+                weights = [0.40, 0.20, 0.40]
+            else:
+                weights = [0.26, 0.18, 0.56]
+
+    counts = allocate_counts_by_weights(planned_households, weights)
+    rows: list[UnitMixRow] = []
+    for size, households in zip(sizes, counts):
+        if households <= 0:
+            continue
+        rows.append(
+            UnitMixRow(
+                label=f"{int(size)}형",
+                households=households,
+                exclusive_area_sqm=float(size),
+                supply_area_sqm=round(size / 0.78, 2),
+            )
+        )
+    return rows
+
+
+def resolve_planned_unit_mix_rows(
+    quick_inputs: QuickDealInputs,
+    advanced_inputs: AdvancedProjectInputs,
+    planned_households: int,
+) -> tuple[list[UnitMixRow], str]:
+    if advanced_inputs.planned_unit_mix_rows:
+        return advanced_inputs.planned_unit_mix_rows, "manual_override"
+    return auto_planned_unit_mix_rows(quick_inputs, advanced_inputs.unit_mix_rows, planned_households), "simulation"
+
+
+def allocation_from_capacities(capacities: list[int], target_count: int) -> list[int]:
+    if target_count <= 0 or not capacities:
+        return [0 for _ in capacities]
+    remaining = target_count
+    allocated = [0 for _ in capacities]
+    capacity_sum = sum(max(capacity, 0) for capacity in capacities)
+    if capacity_sum <= 0:
+        return allocated
+    proportional = allocate_counts_by_weights(remaining, [float(max(capacity, 0)) for capacity in capacities])
+    for index, amount in enumerate(proportional):
+        allocated[index] = min(amount, max(capacities[index], 0))
+    leftover = remaining - sum(allocated)
+    if leftover > 0:
+        order = sorted(range(len(capacities)), key=lambda idx: capacities[idx] - allocated[idx], reverse=True)
+        for index in order:
+            available = capacities[index] - allocated[index]
+            if available <= 0:
+                continue
+            add_amount = min(available, leftover)
+            allocated[index] += add_amount
+            leftover -= add_amount
+            if leftover <= 0:
+                break
+    return allocated
+
+
+def price_table_lookup(
+    price_table: list[MemberPriceRecord],
+    target_exclusive_area: float,
+) -> MemberPriceRecord | None:
+    if not price_table:
+        return None
+    return min(price_table, key=lambda item: abs(item.exclusive_area_sqm - target_exclusive_area))
+
+
 def estimate_current_gross_floor_area_sqm(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedProjectInputs) -> float:
     if advanced_inputs.unit_mix_rows and uses_apartment_reconstruction_flow(quick_inputs):
         return sum(item.households * item.supply_area_sqm for item in advanced_inputs.unit_mix_rows) * 1.08
@@ -997,12 +1149,13 @@ def simulate_project_plan(
     site_area_sqm, site_source = estimate_site_area(quick_inputs, current_gross_floor_area_sqm)
     donation_ratio, donation_source = estimate_donation_ratio(quick_inputs, profile)
     rental_ratio, rental_source = estimate_rental_ratio(quick_inputs, profile)
+    planned_mix_rows = advanced_inputs.planned_unit_mix_rows
     if uses_land_based_flow(quick_inputs):
         redev_base_exclusive = advanced_inputs.rights_inputs.expected_new_exclusive_area or 59.0
         default_supply_area = max(redev_base_exclusive / 0.78, 75.0)
     else:
         default_supply_area = quick_inputs.current_unit_supply_area
-    average_supply_area_sqm = weighted_average_supply_area(advanced_inputs.unit_mix_rows, default_supply_area)
+    average_supply_area_sqm = weighted_average_supply_area(planned_mix_rows or advanced_inputs.unit_mix_rows, default_supply_area)
 
     if site_area_sqm and quick_inputs.target_far:
         gross_floor_area_sqm = site_area_sqm * (quick_inputs.target_far / 100.0)
@@ -1035,6 +1188,9 @@ def simulate_project_plan(
     elif project and project.planned_households is not None:
         planned_households = project.planned_households
         households_source = "official_cleanup"
+    elif planned_mix_rows:
+        planned_households = sum(item.households for item in planned_mix_rows)
+        households_source = "manual_override"
     else:
         planned_households = simulated_total_households
         households_source = "simulation"
@@ -1094,6 +1250,7 @@ def build_feasibility_checks(
     quick_inputs: QuickDealInputs,
     simulation: SimulationResult,
     has_unit_mix: bool = False,
+    has_planned_unit_mix: bool = False,
 ) -> list[FeasibilityCheck]:
     checks: list[FeasibilityCheck] = []
     if simulation.required_avg_floors is not None:
@@ -1136,6 +1293,14 @@ def build_feasibility_checks(
                     "warn",
                     "평형 분포 누락",
                     "대단지 재건축인데 기존 평형 분포 입력이 없어 조합원분양수입을 단일 평형 기준으로 추정했습니다. 대형 평형 비중이 큰 단지는 기존 타입 분포를 넣어야 오차가 줄어듭니다.",
+                )
+            )
+        if not has_planned_unit_mix:
+            checks.append(
+                FeasibilityCheck(
+                    "note",
+                    "준공 후 공급 평형 자동안",
+                    "준공 후 공급할 59/84/114 등의 세대수 계획이 없어 자동 분포로 계산했습니다. 실제 공급 계획과 다르면 일반분양수입과 조합원분양수입이 함께 흔들릴 수 있습니다.",
                 )
             )
     return checks
@@ -1991,11 +2156,23 @@ def fetch_project_from_search_result(result: SearchResult) -> AutofillProjectDat
     return None
 
 
-def estimate_remaining_months(stage: str, autofill: AutofillProjectData | None, delay_one_year: bool, profile_name: str, scenario_name: str) -> tuple[float, str]:
+def estimate_remaining_months(
+    stage: str,
+    autofill: AutofillProjectData | None,
+    delay_one_year: bool,
+    profile_name: str,
+    scenario_name: str,
+    project_kind: ProjectKind,
+    reconstruction_style: ReconstructionStyle,
+) -> tuple[float, str]:
     base_months = float(STAGE_BASE_MONTHS.get(stage, 72))
     scenario = SCENARIOS[scenario_name]
     profile = ASSUMPTION_PROFILES[profile_name]
     source = "manual"
+    if project_kind == ProjectKind.REDEVELOPMENT:
+        base_months *= 1.10
+    elif reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER:
+        base_months *= 1.06
     schedule_text = (autofill.schedule_text if autofill else None) or ""
     if schedule_text:
         matches = DATE_RANGE_PATTERN.findall(schedule_text)
@@ -2011,7 +2188,12 @@ def estimate_remaining_months(stage: str, autofill: AutofillProjectData | None, 
                         year, month = [int(part) for part in normalized.split("-")[:2]]
                         delta_months_candidates.append(max((year - now.year) * 12 + (month - now.month), 0))
                 if delta_months_candidates:
-                    base_months = max(max(delta_months_candidates), 6)
+                    schedule_floor = float(STAGE_SCHEDULE_FLOORS.get(stage, 12))
+                    if project_kind == ProjectKind.REDEVELOPMENT:
+                        schedule_floor *= 1.10
+                    elif reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER:
+                        schedule_floor *= 1.06
+                    base_months = max(max(delta_months_candidates), schedule_floor, 6)
                     source = "schedule_board"
             except Exception:
                 source = "manual"
@@ -2082,6 +2264,8 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         delay_one_year=quick_inputs.delay_one_year,
         profile_name=quick_inputs.scenario_profile,
         scenario_name=scenario_name,
+        project_kind=quick_inputs.project_kind,
+        reconstruction_style=quick_inputs.reconstruction_style,
     )
     sale_rate_baseline = quick_inputs.sale_rate if quick_inputs.sale_rate is not None else SCENARIOS[BASELINE_SCENARIO_NAME]["sale_rate"]
     cash_rate_baseline = quick_inputs.cash_settlement_rate if quick_inputs.cash_settlement_rate is not None else SCENARIOS[BASELINE_SCENARIO_NAME]["cash_settlement_rate"]
@@ -2159,6 +2343,11 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         quick_inputs.current_stage,
         advanced_inputs.member_sale_price_ratio_override,
     )
+    planned_unit_mix_rows, planned_unit_mix_source = resolve_planned_unit_mix_rows(
+        quick_inputs,
+        advanced_inputs,
+        simulation.planned_households,
+    )
     price_table = default_member_price_table(
         user_text=rights_inputs.member_price_text,
         doc_table=parsed_notice.member_price_table if parsed_notice else [],
@@ -2173,6 +2362,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         current_exclusive_area=quick_inputs.current_unit_exclusive_area,
         expected_new_area=rights_inputs.expected_new_exclusive_area,
         member_sale_price_ratio=member_sale_price_ratio,
+        planned_unit_mix_rows=planned_unit_mix_rows,
     )
 
     general_sale_households = simulation.general_sale_households
@@ -2217,7 +2407,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         target_exclusive_area=benchmark_anchor_area,
         target_supply_area_sqm=average_member_supply_area,
     )
-    general_sale_unit_price = resolve_market_unit_price(
+    fallback_general_sale_unit_price = resolve_market_unit_price(
         general_sale_price=quick_inputs.general_sale_price,
         general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
         general_sale_price_per_pyeong_manwon=quick_inputs.general_sale_price_per_pyeong_manwon,
@@ -2237,17 +2427,79 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         target_exclusive_area=average_member_exclusive_area,
         target_supply_area_sqm=average_member_supply_area,
     ) * member_sale_price_ratio
-    if rights_inputs.member_price_text.strip() or (quick_inputs.use_doc_price_table and parsed_notice and parsed_notice.member_price_table):
-        average_member_sale_price = statistics.mean(item.member_sale_price for item in price_table)
-    member_sale_revenue = member_count * average_member_sale_price
-    general_sale_revenue = general_sale_households * general_sale_unit_price * base_sale_rate
     rental_sale_price_per_pyeong_manwon, rental_price_source = default_rental_sale_price_per_pyeong_manwon(
         quick_inputs,
         advanced_inputs.rental_sale_price_per_pyeong_manwon,
     )
-    rental_supply_area_sqm = clamp(simulation.average_supply_area_sqm * 0.80, 75.0, 95.0)
-    rental_unit_price = price_from_supply_pyeong(rental_sale_price_per_pyeong_manwon, rental_supply_area_sqm) or 0.0
-    rental_revenue = rental_households * rental_unit_price
+    if rights_inputs.member_price_text.strip() or (quick_inputs.use_doc_price_table and parsed_notice and parsed_notice.member_price_table):
+        average_member_sale_price = statistics.mean(item.member_sale_price for item in price_table)
+
+    if planned_unit_mix_source == "manual_override":
+        mix_rows = planned_unit_mix_rows or [
+            UnitMixRow(
+                label="기준안",
+                households=max(simulation.planned_households, 1),
+                exclusive_area_sqm=benchmark_anchor_area,
+                supply_area_sqm=max(simulation.average_supply_area_sqm, average_member_supply_area, 1.0),
+            )
+        ]
+        rental_allocations = [0 for _ in mix_rows]
+        remaining_rental = rental_households
+        for index in sorted(range(len(mix_rows)), key=lambda idx: mix_rows[idx].exclusive_area_sqm):
+            if remaining_rental <= 0:
+                break
+            allocated = min(mix_rows[index].households, remaining_rental)
+            rental_allocations[index] = allocated
+            remaining_rental -= allocated
+        member_allocations = allocation_from_capacities(
+            [max(mix_rows[idx].households - rental_allocations[idx], 0) for idx in range(len(mix_rows))],
+            member_count,
+        )
+        general_allocations = [
+            max(mix_rows[idx].households - rental_allocations[idx] - member_allocations[idx], 0)
+            for idx in range(len(mix_rows))
+        ]
+        allocated_member_households = sum(member_allocations)
+        rental_households = sum(rental_allocations)
+        general_sale_households = sum(general_allocations)
+        member_sale_revenue = 0.0
+        general_sale_revenue = 0.0
+        rental_revenue = 0.0
+        for index, mix_row in enumerate(mix_rows):
+            matched_price = price_table_lookup(price_table, mix_row.exclusive_area_sqm)
+            member_unit_price = matched_price.member_sale_price if matched_price else resolve_market_unit_price(
+                general_sale_price=quick_inputs.general_sale_price,
+                general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
+                general_sale_price_per_pyeong_manwon=quick_inputs.general_sale_price_per_pyeong_manwon,
+                comparison_new_price=quick_inputs.comparison_new_price,
+                comparison_anchor_exclusive_area=benchmark_anchor_area,
+                purchase_price=quick_inputs.purchase_price,
+                target_exclusive_area=mix_row.exclusive_area_sqm,
+                target_supply_area_sqm=mix_row.supply_area_sqm,
+            ) * member_sale_price_ratio
+            general_unit_price = resolve_market_unit_price(
+                general_sale_price=quick_inputs.general_sale_price,
+                general_sale_price_basis_exclusive_area=quick_inputs.general_sale_price_basis_exclusive_area,
+                general_sale_price_per_pyeong_manwon=quick_inputs.general_sale_price_per_pyeong_manwon,
+                comparison_new_price=quick_inputs.comparison_new_price,
+                comparison_anchor_exclusive_area=benchmark_anchor_area,
+                purchase_price=quick_inputs.purchase_price,
+                target_exclusive_area=mix_row.exclusive_area_sqm,
+                target_supply_area_sqm=mix_row.supply_area_sqm,
+            )
+            rental_unit_price = price_from_supply_pyeong(rental_sale_price_per_pyeong_manwon, mix_row.supply_area_sqm) or 0.0
+            member_sale_revenue += member_allocations[index] * member_unit_price
+            general_sale_revenue += general_allocations[index] * general_unit_price * base_sale_rate
+            rental_revenue += rental_allocations[index] * rental_unit_price
+        general_sale_unit_price = safe_div(general_sale_revenue, max(general_sale_households, 1), fallback_general_sale_unit_price)
+        average_member_sale_price = safe_div(member_sale_revenue, max(allocated_member_households, 1), average_member_sale_price)
+    else:
+        member_sale_revenue = member_count * average_member_sale_price
+        general_sale_unit_price = fallback_general_sale_unit_price
+        general_sale_revenue = general_sale_households * general_sale_unit_price * base_sale_rate
+        rental_supply_area_sqm = clamp(simulation.average_supply_area_sqm * 0.80, 75.0, 95.0)
+        rental_unit_price = price_from_supply_pyeong(rental_sale_price_per_pyeong_manwon, rental_supply_area_sqm) or 0.0
+        rental_revenue = rental_households * rental_unit_price
     ancillary_revenue = advanced_inputs.ancillary_revenue or direct_construction_cost * 0.02
     other_disposal_revenue = advanced_inputs.other_disposal_revenue or direct_construction_cost * 0.01
 
@@ -2510,6 +2762,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         first_line,
         second_line,
         f"예상 총세대수는 {simulation.planned_households:,}세대, 일반분양은 {general_sale_households:,}세대({fmt_pct(general_sale_ratio)})로 계산했습니다.",
+        f"준공 후 공급 평형 계획은 {humanize_source(planned_unit_mix_source)} 기준이며, {', '.join(f'{row.label} {row.households}세대' for row in planned_unit_mix_rows[:4]) or '자동안 없음'}으로 반영했습니다.",
         f"손익분기 매수가는 {fmt_money(break_even_purchase_price)}, 권장 최대 매수가는 {fmt_money(max_bid_price)}입니다.",
         f"대지지분은 세대당 약 {land_share_est:,.2f}㎡로 추정했고 출처는 {humanize_source(simulation.site_source)}입니다. {cost_note}",
         f"금융비는 PF 조달비율 {fmt_pct(pf_financing_ratio)}, PF 이자 {pf_interest_months:.0f}개월, 세대당 평균 이주비 {fmt_money(average_move_loan_amount)}, 이주비 대여 {move_loan_duration_months:.0f}개월 가정입니다.",
@@ -2518,9 +2771,9 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
     ]
 
     if quick_inputs.land_share:
-        summary_lines[4] = f"입력한 내 대지지분은 {quick_inputs.land_share:,.2f}㎡이고, 구역면적 출처는 {humanize_source(simulation.site_source)}입니다. {cost_note}"
+        summary_lines[5] = f"입력한 내 대지지분은 {quick_inputs.land_share:,.2f}㎡이고, 구역면적 출처는 {humanize_source(simulation.site_source)}입니다. {cost_note}"
     elif simulation.site_area_sqm and quick_inputs.current_households:
-        summary_lines[4] = f"구역면적 기준 세대당 평균 부지면적 참고치는 약 {land_share_est:,.2f}㎡이고 출처는 {humanize_source(simulation.site_source)}입니다. 이 값은 내 대지지분과 다를 수 있습니다. {cost_note}"
+        summary_lines[5] = f"구역면적 기준 세대당 평균 부지면적 참고치는 약 {land_share_est:,.2f}㎡이고 출처는 {humanize_source(simulation.site_source)}입니다. 이 값은 내 대지지분과 다를 수 있습니다. {cost_note}"
     if uses_land_based_flow(quick_inputs) and quick_inputs.land_share and quick_inputs.autofill_project and quick_inputs.autofill_project.site_area_sqm:
         implied_total_site = quick_inputs.land_share * quick_inputs.current_households
         official_site = quick_inputs.autofill_project.site_area_sqm
@@ -2541,6 +2794,7 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             record("rental_revenue", f"{rental_revenue:,.0f}", rental_price_source, 0.64),
             record("planned_households", str(simulation.planned_households), simulation.sources["households"], 0.70),
             record("general_sale_ratio", f"{general_sale_ratio * 100:.2f}%", simulation.sources["general_sale_ratio"], 0.68),
+            record("planned_unit_mix_source", planned_unit_mix_source, planned_unit_mix_source, 0.60, ", ".join(f"{row.label}:{row.households}" for row in planned_unit_mix_rows[:5])),
             record("pf_financing_ratio", f"{pf_financing_ratio * 100:.1f}%", "manual", 0.64),
             record("pf_interest_months", f"{pf_interest_months:.1f}", "manual", 0.64),
             record("avg_move_loan_amount", f"{average_move_loan_amount:,.0f}", "manual", 0.64),
@@ -2581,7 +2835,12 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         source_records=records,
         sensitivity_rows=sensitivity_rows,
         simulation_result=simulation,
-        feasibility_checks=build_feasibility_checks(quick_inputs, simulation, bool(advanced_inputs.unit_mix_rows)),
+        feasibility_checks=build_feasibility_checks(
+            quick_inputs,
+            simulation,
+            bool(advanced_inputs.unit_mix_rows),
+            bool(advanced_inputs.planned_unit_mix_rows),
+        ),
         max_bid_price=max_bid_price,
         break_even_purchase_price=break_even_purchase_price,
         selected_allocation=selected,
@@ -2610,6 +2869,8 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         floor_factor=floor_adj if show_advanced_detail and settlement_ready else None,
         price_table=price_table if show_advanced_detail and settlement_ready else [],
         allocation_options=allocations,
+        planned_unit_mix_rows=planned_unit_mix_rows,
+        planned_unit_mix_source=planned_unit_mix_source,
     )
 
 
@@ -2843,6 +3104,21 @@ def allocation_rows(result: QuickResult) -> list[dict[str, str]]:
     return rows
 
 
+def planned_unit_mix_display_rows(result: QuickResult) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item in result.planned_unit_mix_rows:
+        rows.append(
+            {
+                "타입": item.label,
+                "세대수": f"{item.households:,}세대",
+                "전용㎡": f"{item.exclusive_area_sqm:,.1f}",
+                "공급㎡": f"{item.supply_area_sqm:,.1f}",
+                "출처": humanize_source(result.planned_unit_mix_source),
+            }
+        )
+    return rows
+
+
 def bucket_rows(result: QuickResult) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for bucket in result.cost_buckets:
@@ -2947,7 +3223,7 @@ def render_result_summary(result: QuickResult) -> None:
     if st is None:
         return
     st.markdown("<div class='section-card'><div class='soft-title'>핵심 요약</div></div>", unsafe_allow_html=True)
-    for line in result.summary_lines[:3]:
+    for line in result.summary_lines[:4]:
         st.markdown(f"<div class='result-blurb'>{escape(line)}</div>", unsafe_allow_html=True)
     render_table(core_result_rows(result), "핵심 결과")
 
@@ -3259,6 +3535,7 @@ def main() -> None:
                 member_price_text="",
             ),
             unit_mix_rows=[],
+            planned_unit_mix_rows=[],
             member_sale_price_ratio_override=(member_sale_price_ratio_pct / 100.0) if member_sale_price_ratio_pct else None,
             rental_sale_price_per_pyeong_manwon=rental_sale_price_per_pyeong_manwon or None,
             pf_financing_ratio=default_pf_financing_ratio(project_kind),
@@ -3280,12 +3557,19 @@ def main() -> None:
             delay_one_year=delay_one_year,
             profile_name=assumption_profile,
             scenario_name=scenario_focus,
+            project_kind=project_kind,
+            reconstruction_style=reconstruction_style,
         )
         preview_simulation = simulate_project_plan(
             preview_quick_inputs,
             preview_advanced_inputs,
             preview_quick_inputs.cash_settlement_rate or 0.0,
             preview_profile,
+        )
+        preview_planned_unit_mix_rows = auto_planned_unit_mix_rows(
+            preview_quick_inputs,
+            preview_advanced_inputs.unit_mix_rows,
+            preview_simulation.planned_households,
         )
 
         st.markdown("#### 자동 제안값")
@@ -3302,6 +3586,25 @@ def main() -> None:
             ],
             "자동 제안 요약",
         )
+        render_table(
+            [
+                {
+                    "타입": item.label,
+                    "세대수": f"{item.households:,}세대",
+                    "전용㎡": f"{item.exclusive_area_sqm:,.1f}",
+                    "공급㎡": f"{item.supply_area_sqm:,.1f}",
+                }
+                for item in preview_planned_unit_mix_rows
+            ],
+            "준공 후 공급 평형 자동안",
+        )
+        planned_unit_mix_text = st.text_area(
+            "준공 후 공급 평형 계획 직접입력(선택)",
+            value="",
+            height=110,
+            help=FIELD_HELP["planned_unit_mix"],
+        )
+        st.caption("비워두면 위 자동안을 사용합니다. 형식은 `타입,세대수,전용,공급` 입니다. 예: `84형,420,84,107.7`")
 
         st.markdown("#### 자동값 직접 수정")
         o1, o2, o3, o4 = st.columns(4)
@@ -3520,6 +3823,7 @@ def main() -> None:
             member_price_text=member_price_text,
         ),
         unit_mix_rows=parse_unit_mix_text(unit_mix_text),
+        planned_unit_mix_rows=parse_unit_mix_text(planned_unit_mix_text),
         member_sale_price_ratio_override=(member_sale_price_ratio_pct / 100.0) if member_sale_price_ratio_pct else None,
         rental_sale_price_per_pyeong_manwon=rental_sale_price_per_pyeong_manwon or None,
         pf_financing_ratio=pf_financing_ratio_pct / 100.0,
@@ -3558,6 +3862,7 @@ def main() -> None:
 
     with st.expander("자동 추정과 공식값 반영", expanded=False):
         render_table(simulation_rows(focus_result), "자동 추정과 공식값 반영")
+        render_table(planned_unit_mix_display_rows(focus_result), "준공 후 공급 평형 계획")
         render_table(project_summary_rows(focus_result), "사업수지 요약")
 
     with st.expander("평형별 정산액 시뮬레이션", expanded=bool(focus_result.allocation_options)):
