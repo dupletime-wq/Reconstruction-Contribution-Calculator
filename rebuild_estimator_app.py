@@ -304,6 +304,33 @@ class SearchResult:
     subtitle: str
     url: str = ""
     confidence: float = 0.0
+    capability: str = "external_link_only"
+    structured_fields_count: int = 0
+    status_reason: str = ""
+
+
+@dataclass
+class FieldCandidate:
+    field_name: str
+    value: object
+    source: str
+    confidence: float
+    note: str = ""
+
+
+@dataclass
+class UnitMixCandidateBundle:
+    source: str
+    confidence: float
+    rows: list["UnitMixRow"] = field(default_factory=list)
+    note: str = ""
+
+
+@dataclass
+class SourceHealth:
+    source: str
+    status: str
+    reason: str = ""
 
 
 class SearchAdapter(Protocol):
@@ -347,8 +374,17 @@ class AutofillProjectData:
     schedule_text: str | None = None
     source_records: list[SourceRecord] = field(default_factory=list)
     observed_fields: dict[str, ObservedValue[object]] = field(default_factory=dict)
+    field_candidates: dict[str, list[FieldCandidate]] = field(default_factory=dict)
     external_links: list[tuple[str, str]] = field(default_factory=list)
     search_source: str = "official_cleanup"
+    search_capability: str = "official_cleanup"
+    search_status_reason: str = ""
+    structured_fields_count: int = 0
+    existing_unit_mix_rows: list["UnitMixRow"] = field(default_factory=list)
+    planned_unit_mix_candidates: list["UnitMixRow"] = field(default_factory=list)
+    unit_mix_source: str = "simulation"
+    unit_mix_confidence: float = 0.0
+    source_health: list[SourceHealth] = field(default_factory=list)
 
 
 @dataclass
@@ -555,6 +591,39 @@ def attach_observed(project: AutofillProjectData, field_name: str, value: object
     if value in (None, "", []):
         return
     project.observed_fields[field_name] = observed(value, source, confidence, note)
+    project.field_candidates.setdefault(field_name, []).append(FieldCandidate(field_name, value, source, confidence, note))
+
+
+def count_structured_project_fields(project: AutofillProjectData | None) -> int:
+    if project is None:
+        return 0
+    fields = (
+        project.site_area_sqm,
+        project.target_building_coverage_ratio,
+        project.target_far,
+        project.current_households,
+        project.owner_count,
+        project.planned_households,
+        project.sale_households_total,
+        project.sale_households,
+        project.rental_households,
+        project.public_facility_area_sqm,
+        project.donation_area_sqm,
+    )
+    return sum(1 for value in fields if value not in (None, "", []))
+
+
+def sync_project_capability(project: AutofillProjectData, capability: str | None = None, status_reason: str | None = None) -> AutofillProjectData:
+    if capability is not None:
+        project.search_capability = capability
+    if status_reason is not None:
+        project.search_status_reason = status_reason
+    project.structured_fields_count = count_structured_project_fields(project)
+    return project
+
+
+def add_source_health(project: AutofillProjectData, source: str, status: str, reason: str = "") -> None:
+    project.source_health.append(SourceHealth(source=source, status=status, reason=reason))
 
 
 def merge_external_links(*projects: AutofillProjectData | None) -> list[tuple[str, str]]:
@@ -818,6 +887,43 @@ def weighted_average_exclusive_area(unit_mix_rows: list[UnitMixRow], default_exc
     return safe_div(weighted_area, total_households, default_exclusive_area)
 
 
+def estimate_supply_area_from_exclusive_area(
+    exclusive_area_sqm: float,
+    *,
+    project_kind: ProjectKind | None = None,
+    reconstruction_style: ReconstructionStyle | None = None,
+) -> float:
+    size = max(float(exclusive_area_sqm), 1.0)
+    if project_kind == ProjectKind.REDEVELOPMENT or reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER:
+        ratio = 1.27 if size <= 59 else 1.25 if size <= 84 else 1.22
+    elif size <= 59:
+        ratio = 1.30
+    elif size <= 74:
+        ratio = 1.28
+    elif size <= 84:
+        ratio = 1.27
+    elif size <= 101:
+        ratio = 1.25
+    else:
+        ratio = 1.23
+    return round(size * ratio, 2)
+
+
+def infer_unit_mix_label(exclusive_area_sqm: float) -> str:
+    return f"{int(round(exclusive_area_sqm))}형"
+
+
+def estimate_exclusive_area_from_supply_area(
+    supply_area_sqm: float,
+    *,
+    project_kind: ProjectKind | None = None,
+    reconstruction_style: ReconstructionStyle | None = None,
+) -> float:
+    supply = max(float(supply_area_sqm), 1.0)
+    ratios = [1.27, 1.25] if project_kind == ProjectKind.REDEVELOPMENT or reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER else [1.30, 1.27, 1.23]
+    return round(statistics.mean(supply / ratio for ratio in ratios), 2)
+
+
 def default_member_price_table(
     user_text: str,
     doc_table: list[MemberPriceRecord],
@@ -848,7 +954,11 @@ def default_member_price_table(
         sizes = sorted({59.0, 84.0, 101.0, 114.0, round(base_exclusive)})
     rows: list[MemberPriceRecord] = []
     for size in sizes:
-        supply_area = round(size / 0.78, 2)
+        supply_area = estimate_supply_area_from_exclusive_area(
+            size,
+            project_kind=project_kind,
+            reconstruction_style=reconstruction_style,
+        )
         market_price = resolve_market_unit_price(
             general_sale_price=general_sale_price,
             general_sale_price_basis_exclusive_area=general_sale_price_basis_exclusive_area,
@@ -860,7 +970,7 @@ def default_member_price_table(
             target_supply_area_sqm=supply_area,
         )
         member_price = market_price * member_sale_price_ratio
-        rows.append(MemberPriceRecord(label=f"{int(size)}형", exclusive_area_sqm=float(size), supply_area_sqm=round(size / 0.78, 2), member_sale_price=member_price))
+        rows.append(MemberPriceRecord(label=infer_unit_mix_label(size), exclusive_area_sqm=float(size), supply_area_sqm=supply_area, member_sale_price=member_price))
     return rows
 
 
@@ -934,15 +1044,21 @@ def parse_unit_mix_text(raw_text: str) -> list[UnitMixRow]:
         if not line:
             continue
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 4:
+        if len(parts) not in {3, 4}:
             continue
         try:
+            exclusive_area = float(parts[2])
+            supply_area = (
+                float(parts[3])
+                if len(parts) == 4
+                else estimate_supply_area_from_exclusive_area(exclusive_area)
+            )
             rows.append(
                 UnitMixRow(
                     label=parts[0],
                     households=int(float(parts[1])),
-                    exclusive_area_sqm=float(parts[2]),
-                    supply_area_sqm=float(parts[3]),
+                    exclusive_area_sqm=exclusive_area,
+                    supply_area_sqm=supply_area,
                 )
             )
         except ValueError:
@@ -1036,10 +1152,14 @@ def auto_planned_unit_mix_rows(
             continue
         rows.append(
             UnitMixRow(
-                label=f"{int(size)}형",
+                label=infer_unit_mix_label(size),
                 households=households,
                 exclusive_area_sqm=float(size),
-                supply_area_sqm=round(size / 0.78, 2),
+                supply_area_sqm=estimate_supply_area_from_exclusive_area(
+                    size,
+                    project_kind=quick_inputs.project_kind,
+                    reconstruction_style=quick_inputs.reconstruction_style,
+                ),
             )
         )
     return rows
@@ -1152,7 +1272,14 @@ def simulate_project_plan(
     planned_mix_rows = advanced_inputs.planned_unit_mix_rows
     if uses_land_based_flow(quick_inputs):
         redev_base_exclusive = advanced_inputs.rights_inputs.expected_new_exclusive_area or 59.0
-        default_supply_area = max(redev_base_exclusive / 0.78, 75.0)
+        default_supply_area = max(
+            estimate_supply_area_from_exclusive_area(
+                redev_base_exclusive,
+                project_kind=quick_inputs.project_kind,
+                reconstruction_style=quick_inputs.reconstruction_style,
+            ),
+            75.0,
+        )
     else:
         default_supply_area = quick_inputs.current_unit_supply_area
     average_supply_area_sqm = weighted_average_supply_area(planned_mix_rows or advanced_inputs.unit_mix_rows, default_supply_area)
@@ -1770,6 +1897,66 @@ def extract_households_from_supply_table(table: list[list[str]]) -> int | None:
     return sum(counts) if counts else None
 
 
+def header_index_map(header_row: list[str]) -> dict[str, int]:
+    normalized = {re.sub(r"\s+", "", cell): idx for idx, cell in enumerate(header_row)}
+    alias_groups = {
+        "label": ("주택형", "평형", "타입", "구분", "전용면적"),
+        "households": ("세대수", "공급세대수", "가구수", "호수"),
+        "exclusive": ("전용면적", "전용", "전용㎡", "전용면적㎡"),
+        "supply": ("공급면적", "공급", "공급㎡", "분양면적"),
+    }
+    result: dict[str, int] = {}
+    for key, aliases in alias_groups.items():
+        for alias in aliases:
+            if alias in normalized:
+                result[key] = normalized[alias]
+                break
+    return result
+
+
+def extract_unit_mix_rows_from_table(table: list[list[str]]) -> list[UnitMixRow]:
+    if len(table) < 2:
+        return []
+    index_map = header_index_map(table[0])
+    if "households" not in index_map or "exclusive" not in index_map:
+        return []
+    rows: list[UnitMixRow] = []
+    for raw_row in table[1:]:
+        if len(raw_row) <= max(index_map.values()):
+            continue
+        households = parse_int(raw_row[index_map["households"]])
+        exclusive_area = parse_float(raw_row[index_map["exclusive"]])
+        if households is None or households <= 0 or exclusive_area is None or exclusive_area <= 0:
+            continue
+        label = raw_row[index_map.get("label", index_map["exclusive"])].strip() or infer_unit_mix_label(exclusive_area)
+        supply_area = None
+        if "supply" in index_map:
+            supply_area = parse_float(raw_row[index_map["supply"]])
+        rows.append(
+            UnitMixRow(
+                label=label,
+                households=households,
+                exclusive_area_sqm=exclusive_area,
+                supply_area_sqm=supply_area or estimate_supply_area_from_exclusive_area(exclusive_area),
+            )
+        )
+    return rows
+
+
+def choose_best_unit_mix_candidate(tables: list[list[list[str]]]) -> tuple[list[UnitMixRow], str, float]:
+    best_rows: list[UnitMixRow] = []
+    best_score = 0
+    for table in tables:
+        rows = extract_unit_mix_rows_from_table(table)
+        score = sum(item.households for item in rows)
+        if len(rows) >= 2 and score > best_score:
+            best_rows = rows
+            best_score = score
+    if best_rows:
+        return best_rows, "official_cleanup", 0.72
+    return [], "simulation", 0.0
+
+
 def extract_public_facility_areas(
     land_use_table: list[list[str]],
     facility_table: list[list[str]],
@@ -1873,6 +2060,7 @@ def cleanup_fetch_project_summary(project_slug: str) -> AutofillProjectData | No
     planned_sale_total = extract_households_from_supply_table(sale_table)
     planned_rental = extract_households_from_supply_table(rental_table)
     public_facility_area_sqm, donation_area_sqm = extract_public_facility_areas(land_use_table, facility_table)
+    existing_unit_mix_rows, unit_mix_source, unit_mix_confidence = choose_best_unit_mix_candidate(tables)
     member_seed = current_households or owner_count
     planned_general_sale = None
     if planned_sale_total is not None and member_seed is not None:
@@ -1903,10 +2091,15 @@ def cleanup_fetch_project_summary(project_slug: str) -> AutofillProjectData | No
         rental_households=planned_rental,
         public_facility_area_sqm=public_facility_area_sqm,
         donation_area_sqm=donation_area_sqm,
+        existing_unit_mix_rows=existing_unit_mix_rows,
+        unit_mix_source=unit_mix_source,
+        unit_mix_confidence=unit_mix_confidence,
     )
     project.schedule_text = cleanup_fetch_schedule_text(cafe_id)
     project.source_records = normalize_cleanup_source_rows(project)
     project.search_source = "official_cleanup"
+    sync_project_capability(project, "official_cleanup")
+    add_source_health(project, "official_cleanup", "ok", "서울 정비몽땅 공식 표를 구조화했습니다.")
     project.external_links.append(("서울 공식 사업개요", summary_url))
     if project.source_url:
         project.external_links.append(("서울 공식 메인", project.source_url))
@@ -1943,6 +2136,8 @@ class CleanupAdapter:
                 subtitle=" / ".join(part for part in [item.district, item.business_type, item.progress_stage or "단계 미확인"] if part),
                 url=item.source_url,
                 confidence=0.88,
+                capability="official_cleanup",
+                structured_fields_count=count_structured_project_fields(item),
             )
             for item in cleanup_search_projects(query)
         ]
@@ -1966,6 +2161,7 @@ def parse_naver_search_links(html_text: str) -> list[SearchResult]:
                 subtitle="네이버 부동산 공개 단지 페이지",
                 url=urllib.parse.urljoin("https://fin.land.naver.com", href),
                 confidence=0.40,
+                capability="external_structured",
             )
         )
     return results
@@ -2003,6 +2199,8 @@ def naver_search_projects(query: str) -> list[SearchResult]:
             subtitle="공개 검색 페이지를 보조 링크로 제공합니다.",
             url=url,
             confidence=0.18,
+            capability="external_link_only",
+            status_reason="정적 HTML에서 구조화 단지 정보를 찾지 못했습니다.",
         )
     ]
 
@@ -2042,6 +2240,15 @@ def naver_fetch_project_summary(project_id: str) -> AutofillProjectData | None:
         project.source_records.append(record("target_far", f"{project.target_far:.1f}", "naver_land", 0.50))
     if project.target_building_coverage_ratio is not None:
         project.source_records.append(record("building_coverage_ratio", f"{project.target_building_coverage_ratio:.1f}", "naver_land", 0.50))
+    is_generic_title = project_name.strip().lower() in {"npay 부동산", "naver", "네이버"}
+    if is_generic_title and not any([project.current_households, project.target_far, project.target_building_coverage_ratio]):
+        project.project_name = ""
+    if count_structured_project_fields(project) >= 2:
+        sync_project_capability(project, "external_structured")
+        add_source_health(project, "naver_land", "partial", "일부 공개 메트릭만 구조화했습니다.")
+    else:
+        sync_project_capability(project, "external_link_only", "정적 HTML에서 단지 메트릭 추출에 실패해 링크만 제공합니다.")
+        add_source_health(project, "naver_land", "link_only", project.search_status_reason)
     return project
 
 
@@ -2069,6 +2276,8 @@ def kgeop_search_projects(query: str) -> list[SearchResult]:
             subtitle="필지/지목/위치 정합성 확인용 보조 링크",
             url=url,
             confidence=0.12,
+            capability="external_link_only",
+            status_reason="공개 지도 링크만 제공합니다.",
         )
     ]
 
@@ -2089,6 +2298,8 @@ def kgeop_fetch_project_summary(project_id: str) -> AutofillProjectData | None:
     )
     project.external_links.append(("KGeoP 공개 지도", project_id))
     project.source_records.append(record("parser_status", "unsupported", "kgeop_public", 0.10, "공개 페이지는 보조 확인 링크로만 제공합니다."))
+    sync_project_capability(project, "external_link_only", "공개 지도 링크만 제공합니다.")
+    add_source_health(project, "kgeop_public", "link_only", project.search_status_reason)
     return project
 
 
@@ -2111,18 +2322,34 @@ def merge_autofill_projects(*projects: AutofillProjectData | None) -> AutofillPr
         if not candidate:
             continue
         for field_name, observed_value in candidate.observed_fields.items():
-            base.observed_fields[field_name] = choose_observed_value(base.observed_fields.get(field_name), observed_value) or observed_value
+            chosen = choose_observed_value(base.observed_fields.get(field_name), observed_value) or observed_value
+            base.observed_fields[field_name] = chosen
+            base.field_candidates.setdefault(field_name, []).extend(candidate.field_candidates.get(field_name, []))
         base.external_links = merge_external_links(base, candidate)
         if not base.project_name and candidate.project_name:
             base.project_name = candidate.project_name
         if not base.source_url and candidate.source_url:
             base.source_url = candidate.source_url
+        if not base.existing_unit_mix_rows and candidate.existing_unit_mix_rows:
+            base.existing_unit_mix_rows = list(candidate.existing_unit_mix_rows)
+            base.unit_mix_source = candidate.unit_mix_source
+            base.unit_mix_confidence = candidate.unit_mix_confidence
+        if not base.planned_unit_mix_candidates and candidate.planned_unit_mix_candidates:
+            base.planned_unit_mix_candidates = list(candidate.planned_unit_mix_candidates)
         base.source_records.extend(candidate.source_records)
+        base.source_health.extend(candidate.source_health)
     for field_name, observed_value in base.observed_fields.items():
         try:
-            setattr(base, field_name, observed_value.value)
+            current_value = getattr(base, field_name, None)
+            source_rank = {"manual": 6, "document": 5, "official_cleanup": 4, "external_structured": 3, "naver_land": 2, "kgeop_public": 1, "simulation": 0}
+            current_source = ""
+            if field_name in base.field_candidates and base.field_candidates[field_name]:
+                current_source = max(base.field_candidates[field_name], key=lambda item: (source_rank.get(item.source, 0), item.confidence)).source
+            if current_value in (None, "", []) or source_rank.get(observed_value.source, 0) >= source_rank.get(current_source, 0):
+                setattr(base, field_name, observed_value.value)
         except Exception:
             continue
+    sync_project_capability(base, base.search_capability, base.search_status_reason)
     return base
 
 
@@ -2391,10 +2618,21 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         advanced_inputs.unit_mix_rows,
         max(
             quick_inputs.current_unit_supply_area or 0.0,
-            (rights_inputs.expected_new_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0) / 0.78,
+            estimate_supply_area_from_exclusive_area(
+                rights_inputs.expected_new_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0,
+                project_kind=quick_inputs.project_kind,
+                reconstruction_style=quick_inputs.reconstruction_style,
+            ),
         ),
     )
-    general_sale_reference_exclusive_area = max(simulation.average_supply_area_sqm * 0.78, 1.0)
+    general_sale_reference_exclusive_area = max(
+        estimate_exclusive_area_from_supply_area(
+            simulation.average_supply_area_sqm,
+            project_kind=quick_inputs.project_kind,
+            reconstruction_style=quick_inputs.reconstruction_style,
+        ),
+        1.0,
+    )
     general_sale_reference_supply_area = max(simulation.average_supply_area_sqm, average_member_supply_area, 1.0)
     benchmark_anchor_area = rights_inputs.expected_new_exclusive_area or average_member_exclusive_area or quick_inputs.current_unit_exclusive_area or 84.0
     benchmark_new_price = resolve_market_unit_price(
@@ -2883,6 +3121,51 @@ def source_badge(text: str, tone: str = "base") -> str:
     )
 
 
+def capability_badge(capability: str, reason: str = "") -> str:
+    labels = {
+        "official_cleanup": ("공식 구조화", "ok"),
+        "external_structured": ("외부 구조화", "base"),
+        "external_link_only": ("링크 확인용", "warn"),
+    }
+    label, tone = labels.get(capability, ("자동조회", "base"))
+    suffix = f" · {reason}" if reason else ""
+    return source_badge(f"{label}{suffix}", tone)
+
+
+def unit_mix_rows_to_text(rows: list[UnitMixRow]) -> str:
+    return "\n".join(f"{row.label},{row.households},{row.exclusive_area_sqm:.1f},{row.supply_area_sqm:.1f}" for row in rows)
+
+
+def default_existing_unit_mix_text(
+    project: AutofillProjectData | None,
+    current_exclusive_area: float,
+    current_supply_area: float,
+    current_households: int,
+) -> str:
+    if project and project.existing_unit_mix_rows:
+        return unit_mix_rows_to_text(project.existing_unit_mix_rows)
+    return default_unit_mix_text(current_exclusive_area, current_supply_area, current_households)
+
+
+def default_planned_unit_mix_text(project: AutofillProjectData | None) -> str:
+    if project and project.planned_unit_mix_candidates:
+        return unit_mix_rows_to_text(project.planned_unit_mix_candidates)
+    return ""
+
+
+def precision_gap_messages(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedProjectInputs) -> list[str]:
+    messages: list[str] = []
+    if quick_inputs.project_kind == ProjectKind.RECONSTRUCTION and quick_inputs.reconstruction_style == ReconstructionStyle.APARTMENT and not advanced_inputs.unit_mix_rows:
+        messages.append("기존 평형 분포가 없어서 현재 연면적과 조합원 분포를 단일 기준 면적으로 추정했습니다.")
+    if not advanced_inputs.rights_inputs.expected_new_exclusive_area:
+        messages.append("예상 새 전용면적이 없어서 배정평형 비교를 보수적인 기본값으로 계산했습니다.")
+    if not quick_inputs.general_sale_price_basis_exclusive_area and not quick_inputs.general_sale_price_per_pyeong_manwon:
+        messages.append("일반분양 기준 면적이 없어 일반분양가를 비교 신축 시세 기준으로 환산했습니다.")
+    if uses_land_based_flow(quick_inputs) and not quick_inputs.land_share:
+        messages.append("대지지분이 없어서 토지형 사업의 정산액 왜곡 가능성이 큽니다.")
+    return messages
+
+
 def inject_styles() -> None:
     if st is None:
         return
@@ -3006,10 +3289,11 @@ def render_project_autofill(project: AutofillProjectData | None) -> None:
     card_html = (
         "<div class='section-card'>"
         f"<div class='soft-title'>{escape(project.project_name)}</div>"
-        f"<div>{badge_text.get(project.search_source, source_badge('자동조회', 'base'))}{source_badge(project.business_type or '사업유형 미확인')}{source_badge((project.project_kind.value if project.project_kind else '유형 미확인'), 'base')}</div>"
+        f"<div>{badge_text.get(project.search_source, source_badge('자동조회', 'base'))}{capability_badge(project.search_capability, project.search_status_reason)}{source_badge(project.business_type or '사업유형 미확인')}{source_badge((project.project_kind.value if project.project_kind else '유형 미확인'), 'base')}</div>"
         f"<p class='mini-note'>대표지번: {escape(project.representative_lot or '-')} / 조합원·권리자 수: {project.current_households or project.owner_count or '-'} / 계획 세대수: {project.planned_households or '-'}</p>"
         f"<p class='mini-note'>목표 건폐율: {project.target_building_coverage_ratio or '-'}% / 목표 용적률: {project.target_far or '-'}% / 분양주택: {project.sale_households_total or '-'}세대 / 추정 일반분양: {project.sale_households or '-'}세대 / 임대: {project.rental_households or '-'}세대</p>"
         f"<p class='mini-note'>공공시설 반영면적: {project.public_facility_area_sqm or '-'}㎡ / 명시 기부채납: {project.donation_area_sqm or '-'}㎡ / 출처: {humanize_source(project.search_source)}</p>"
+        f"<p class='mini-note'>세대구성 후보: {len(project.existing_unit_mix_rows) or len(project.planned_unit_mix_candidates)}건 / 반영 출처: {humanize_source(project.unit_mix_source)}</p>"
         + (f"<div class='mini-note' style='margin-top:8px;'><strong>외부 확인 링크</strong><ul style='margin:6px 0 0 18px;'>{external_links}</ul></div>" if external_links else "")
         + "</div>"
     )
@@ -3135,6 +3419,7 @@ def simulation_rows(result: QuickResult) -> list[dict[str, str]]:
         {"항목": "일반분양 비율", "값": fmt_pct(simulation.general_sale_ratio), "출처": humanize_source(simulation.sources["general_sale_ratio"])},
         {"항목": "임대주택 세대수", "값": f"{simulation.rental_households:,}세대", "출처": humanize_source(simulation.sources["rental_ratio"])},
         {"항목": "기부채납 비율", "값": fmt_pct(simulation.donation_ratio), "출처": humanize_source(simulation.sources["donation_ratio"])},
+        {"항목": "준공 후 평형 계획", "값": humanize_source(result.planned_unit_mix_source), "출처": humanize_source(result.planned_unit_mix_source)},
         {"항목": "대지면적", "값": f"{simulation.site_area_sqm:,.1f}㎡" if simulation.site_area_sqm is not None else "-", "출처": humanize_source(simulation.site_source)},
     ]
     if simulation.required_avg_floors is not None:
@@ -3252,7 +3537,19 @@ def render_input_guide(project_kind: ProjectKind) -> None:
 
 
 def default_unit_mix_text(current_exclusive_area: float, current_supply_area: float, current_households: int) -> str:
-    return f"기존대표형,{current_households},{current_exclusive_area:.1f},{current_supply_area:.1f}"
+    guessed_sizes = sorted({59.0, 74.0, 84.0, float(round(current_exclusive_area))})
+    if current_exclusive_area >= 100:
+        guessed_sizes.append(101.0)
+    guessed_sizes = sorted({size for size in guessed_sizes if size > 0})
+    weights = [0.20, 0.15, 0.45, 0.20] if len(guessed_sizes) >= 4 else [0.30, 0.20, 0.50]
+    counts = allocate_counts_by_weights(current_households, weights[: len(guessed_sizes)])
+    rows: list[str] = []
+    for size, households in zip(guessed_sizes, counts):
+        if households <= 0:
+            continue
+        supply = current_supply_area if abs(size - current_exclusive_area) < 0.1 else estimate_supply_area_from_exclusive_area(size)
+        rows.append(f"{infer_unit_mix_label(size)},{households},{size:.1f},{supply:.1f}")
+    return "\n".join(rows) or f"{infer_unit_mix_label(current_exclusive_area)},{current_households},{current_exclusive_area:.1f},{current_supply_area:.1f}"
 
 
 def main() -> None:
@@ -3301,7 +3598,10 @@ def main() -> None:
         if search_query and not search_results:
             st.warning("일치하는 공개 검색 결과를 찾지 못했습니다. 아래 수동 입력으로 계속 진행할 수 있습니다.")
         if search_results:
-            labels = [f"[{humanize_source(item.source)}] {item.title} / {item.subtitle}" for item in search_results]
+            labels = [
+                f"[{humanize_source(item.source)} · {item.capability}] {item.title} / {item.subtitle}{(' / ' + item.status_reason) if item.status_reason else ''}"
+                for item in search_results
+            ]
             selected_label = st.selectbox("검색 결과", labels)
             selected_result = search_results[labels.index(selected_label)]
             primary_project = fetch_project_from_search_result(selected_result)
@@ -3600,7 +3900,7 @@ def main() -> None:
         )
         planned_unit_mix_text = st.text_area(
             "준공 후 공급 평형 계획 직접입력(선택)",
-            value="",
+            value=default_planned_unit_mix_text(autofill_project),
             height=110,
             help=FIELD_HELP["planned_unit_mix"],
         )
@@ -3739,7 +4039,12 @@ def main() -> None:
             brokerage_rate_pct = st.number_input("중개/처분비율(%)", min_value=0.0, max_value=100.0, value=0.4, step=0.1)
         unit_mix_text = st.text_area(
             "기존 세대 타입별 분포(선택)",
-            value=default_unit_mix_text(current_unit_exclusive_area, current_unit_supply_area, int(current_households)) if project_kind == ProjectKind.RECONSTRUCTION and not land_based_reconstruction else "",
+            value=default_existing_unit_mix_text(
+                autofill_project,
+                current_unit_exclusive_area,
+                current_unit_supply_area,
+                int(current_households),
+            ) if project_kind == ProjectKind.RECONSTRUCTION and not land_based_reconstruction else "",
             height=90,
             help=FIELD_HELP["unit_mix"],
             disabled=project_kind == ProjectKind.REDEVELOPMENT or land_based_reconstruction,
@@ -3849,6 +4154,8 @@ def main() -> None:
         st.warning("서울 공식값을 못 불러온 상태라 일부 값은 수동 입력과 휴리스틱으로 계산됩니다.")
     if detail_allowed and focus_result.old_asset_source == "purchase_price_heuristic":
         st.warning("정밀계산용 참고가격이 없어서 권리가액은 매수가 기반 휴리스틱으로 추정했습니다.")
+    for message in precision_gap_messages(quick_inputs, advanced_inputs):
+        st.info(message)
     render_result_summary(focus_result)
     render_table(why_rows(focus_result), "왜 이렇게 계산됐는지")
     render_table(feasibility_rows(focus_result), "왜곡 위험 점검")
