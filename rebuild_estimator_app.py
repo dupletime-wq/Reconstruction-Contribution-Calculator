@@ -2258,9 +2258,8 @@ def naver_build_project_from_item(item: dict[str, object], query: str) -> Autofi
     project.external_links.append(("네이버 부동산 모바일 검색", f"https://m.land.naver.com/search/result/{urllib.parse.quote(project_name)}"))
     if project.source_url:
         project.external_links.append(("네이버 부동산 단지 링크", project.source_url))
-    kgeop_keyword = project.representative_lot or f"{project.district} {project_name}".strip()
-    if kgeop_keyword:
-        project.external_links.append(("KGeoP 주소/필지 검색", f"https://kgeop.go.kr/cmm/unitySearch/getUnitySearchList.do?searchKeyword={urllib.parse.quote(kgeop_keyword)}"))
+    if project.representative_lot or project_name:
+        project.external_links.append(("KGeoP 공개 지도", "https://kgeop.go.kr/info/infoMap.do?initMode=L"))
     if households is not None:
         attach_observed(project, "current_households", households, "naver_land", 0.76)
         project.source_records.append(record("current_households", str(households), "naver_land", 0.76))
@@ -2420,17 +2419,17 @@ def kgeop_search_projects(query: str) -> list[SearchResult]:
     keyword = query.strip()
     if not keyword:
         return []
-    url = f"https://kgeop.go.kr/cmm/unitySearch/getUnitySearchList.do?searchKeyword={urllib.parse.quote(keyword)}"
+    url = "https://kgeop.go.kr/info/infoMap.do?initMode=L"
     return [
         SearchResult(
             source="kgeop_public",
             project_id=url,
             title=f"{keyword} KGeoP 공개 지도",
-            subtitle="주소/필지/위치 정합성 확인용 KGeoP 검색 링크",
+            subtitle="KGeoP 지도에서 주소/필지 검색용",
             url=url,
             confidence=0.12,
             capability="external_link_only",
-            status_reason="대지지분 직접 추출은 아직 지원하지 않고 KGeoP 검색 링크를 제공합니다.",
+            status_reason="KGeoP 지도 화면으로 연결합니다. 지도 내부 검색창에서 주소/필지를 다시 찾는 용도입니다.",
         )
     ]
 
@@ -3741,7 +3740,7 @@ def main() -> None:
             assumption_profile = st.select_slider("가정 프리셋", options=list(ASSUMPTION_PROFILES.keys()), value="기준")
         with s2:
             lookup_enabled = st.checkbox("서울 공식값 자동조회", value=True)
-            use_external_lookup = st.checkbox("외부 소스 추가조회", value=False)
+            use_external_lookup = st.checkbox("외부 소스 추가조회", value=True)
         with s3:
             aggressive_upsize = st.checkbox("공격적 평형 업사이즈 허용", value=False)
             uploaded_files = st.file_uploader("문서 업로드", type=["pdf", "csv"], accept_multiple_files=True)
