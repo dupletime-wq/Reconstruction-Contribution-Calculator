@@ -8,6 +8,7 @@ from html.parser import HTMLParser
 from io import BytesIO, StringIO
 import re
 import statistics
+from typing import Generic, Protocol, TypeVar
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,6 +47,8 @@ SCENARIOS: dict[str, dict[str, float]] = {
         "duration_multiplier": 1.28,
     },
 }
+
+BASELINE_SCENARIO_NAME = "기준"
 
 ASSUMPTION_PROFILES: dict[str, dict[str, float]] = {
     "공격": {
@@ -153,6 +156,8 @@ SOURCE_LABELS: dict[str, str] = {
     "heuristic_default": "휴리스틱 기본값",
     "engine": "계산 엔진",
     "official_cleanup": "서울 정비사업 정보몽땅",
+    "naver_land": "네이버 부동산 공개 페이지",
+    "kgeop_public": "KGeoP 공개 지도",
     "manual": "직접 입력",
     "document": "업로드 문서",
     "preset": "기본 프리셋",
@@ -226,6 +231,9 @@ class ReconstructionStyle(str, Enum):
     DETACHED_CLUSTER = "단독주택 묶음형"
 
 
+T = TypeVar("T")
+
+
 MONEY_TOKEN_PATTERN = re.compile(
     r"(-?\d[\d,]*(?:\.\d+)?)\s*(jo|eok|cheonman|baekman|manwon|조|억|천만|만원|원)?",
     re.IGNORECASE,
@@ -266,6 +274,35 @@ class ParsedProjectNotice:
 
 
 @dataclass
+class ObservedValue(Generic[T]):
+    value: T
+    source: str
+    confidence: float
+    observed_at: str
+    note: str = ""
+
+
+@dataclass
+class SearchResult:
+    source: str
+    project_id: str
+    title: str
+    subtitle: str
+    url: str = ""
+    confidence: float = 0.0
+
+
+class SearchAdapter(Protocol):
+    def search(self, query: str) -> list[SearchResult]:
+        ...
+
+
+class ProjectAdapter(Protocol):
+    def fetch(self, project_id: str) -> "AutofillProjectData | None":
+        ...
+
+
+@dataclass
 class AutofillProjectData:
     query: str
     project_name: str
@@ -295,6 +332,9 @@ class AutofillProjectData:
     donation_area_sqm: float | None = None
     schedule_text: str | None = None
     source_records: list[SourceRecord] = field(default_factory=list)
+    observed_fields: dict[str, ObservedValue[object]] = field(default_factory=dict)
+    external_links: list[tuple[str, str]] = field(default_factory=list)
+    search_source: str = "official_cleanup"
 
 
 @dataclass
@@ -473,6 +513,8 @@ class QuickResult:
     floor_factor: float | None = None
     price_table: list[MemberPriceRecord] = field(default_factory=list)
     allocation_options: list[dict[str, float | str]] = field(default_factory=list)
+    scenario_delta_summary: str = ""
+    scenario_visibility: bool = True
 
 
 def cache_data(*args, **kwargs):
@@ -486,6 +528,57 @@ def cache_data(*args, **kwargs):
 
 def record(key: str, value: str, source: str, confidence: float, notes: str = "") -> SourceRecord:
     return SourceRecord(key=key, value=value, source=source, confidence=confidence, notes=notes)
+
+
+def observed(value: T, source: str, confidence: float, note: str = "") -> ObservedValue[T]:
+    return ObservedValue(value=value, source=source, confidence=confidence, observed_at=datetime.now().strftime("%Y-%m-%d %H:%M"), note=note)
+
+
+def attach_observed(project: AutofillProjectData, field_name: str, value: object, source: str, confidence: float, note: str = "") -> None:
+    if value in (None, "", []):
+        return
+    project.observed_fields[field_name] = observed(value, source, confidence, note)
+
+
+def merge_external_links(*projects: AutofillProjectData | None) -> list[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    links: list[tuple[str, str]] = []
+    for project in projects:
+        if not project:
+            continue
+        for label, url in project.external_links:
+            key = (label, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(key)
+    return links
+
+
+def choose_observed_value(
+    current: ObservedValue[object] | None,
+    candidate: ObservedValue[object] | None,
+) -> ObservedValue[object] | None:
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    priority = {
+        "manual": 6,
+        "document": 5,
+        "official_cleanup": 4,
+        "naver_land": 3,
+        "kgeop_public": 2,
+        "simulation": 1,
+        "engine": 0,
+    }
+    current_rank = priority.get(current.source, 0)
+    candidate_rank = priority.get(candidate.source, 0)
+    if candidate_rank > current_rank:
+        return candidate
+    if candidate_rank == current_rank and candidate.confidence >= current.confidence:
+        return candidate
+    return current
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -592,6 +685,20 @@ def default_rental_sale_price_per_pyeong_manwon(
     if override_value is not None:
         return max(float(override_value), 0.0), "manual_override"
     return (1000.0 if quick_inputs.capital_area else 800.0), "preset"
+
+
+def apply_scenario_to_baseline(
+    baseline_value: float,
+    scenario_name: str,
+    key: str,
+    *,
+    low: float,
+    high: float,
+) -> float:
+    baseline_scenario = SCENARIOS[BASELINE_SCENARIO_NAME]
+    scenario = SCENARIOS[scenario_name]
+    delta = float(scenario[key]) - float(baseline_scenario[key])
+    return clamp(float(baseline_value) + delta, low, high)
 
 
 def fmt_pct(value: float | None) -> str:
@@ -981,44 +1088,6 @@ def simulate_project_plan(
             "rental_ratio": rental_source,
         },
     )
-
-
-def build_feasibility_checks(
-    quick_inputs: QuickDealInputs,
-    simulation: SimulationResult,
-    has_unit_mix: bool = False,
-) -> list[FeasibilityCheck]:
-    checks: list[FeasibilityCheck] = []
-    if simulation.required_avg_floors is not None:
-        if simulation.required_avg_floors > 35:
-            checks.append(FeasibilityCheck("risk", "층수 부담", f"목표 FAR와 목표 건폐율 기준 평균 {simulation.required_avg_floors:.1f}층이 필요해 과도할 수 있습니다."))
-        elif simulation.required_avg_floors > 25:
-            checks.append(FeasibilityCheck("warn", "층수 부담", f"목표 FAR와 목표 건폐율 기준 평균 {simulation.required_avg_floors:.1f}층이 필요합니다. 인허가·사업성 검토가 더 필요합니다."))
-        else:
-            checks.append(FeasibilityCheck("ok", "층수 부담", f"목표 FAR와 목표 건폐율 기준 평균 {simulation.required_avg_floors:.1f}층 수준으로 계산됩니다."))
-    else:
-        checks.append(FeasibilityCheck("note", "층수 점검", "목표 건폐율이 없어서 평균층수 점검은 생략했습니다."))
-
-    if simulation.planned_households > int(simulation.simulated_total_households * 1.15):
-        checks.append(FeasibilityCheck("warn", "세대수 과다 가능성", f"입력/공식 계획 세대수 {simulation.planned_households:,}세대가 엔진 추정 {simulation.simulated_total_households:,}세대보다 많이 큽니다."))
-    elif simulation.planned_households < simulation.member_households:
-        checks.append(FeasibilityCheck("risk", "세대수 부족", f"예상 총세대수 {simulation.planned_households:,}세대로는 분양대상 {simulation.member_households:,}세대를 담기 어렵습니다."))
-    else:
-        checks.append(FeasibilityCheck("ok", "세대수 점검", f"예상 총세대수 {simulation.planned_households:,}세대, 일반분양 {simulation.general_sale_households:,}세대로 계산했습니다."))
-
-    if quick_inputs.project_kind == ProjectKind.REDEVELOPMENT:
-        if quick_inputs.autofill_project and quick_inputs.autofill_project.project_kind and quick_inputs.autofill_project.project_kind != quick_inputs.project_kind:
-            checks.append(FeasibilityCheck("risk", "사업유형 불일치", f"서울 공식 사업유형은 {quick_inputs.autofill_project.project_kind.value}인데 현재 {quick_inputs.project_kind.value} 모드로 계산 중입니다."))
-        if not quick_inputs.land_share:
-            checks.append(FeasibilityCheck("risk", "대지지분 누락", "재개발은 내 대지지분이 없으면 권리가액과 정산액(추가분담/환급) 추정이 크게 왜곡됩니다."))
-        tenant_seed = quick_inputs.autofill_project.tenant_count if quick_inputs.autofill_project else None
-        if tenant_seed:
-            checks.append(FeasibilityCheck("ok", "세입자 반영", f"서울 공식값 기준 세입자 {tenant_seed:,}명을 보상비 추정에 반영했습니다."))
-        else:
-            checks.append(FeasibilityCheck("note", "세입자 반영", "세입자 수 공식값이 없어 재개발 세입자 보상은 보수적 휴리스틱으로 계산했습니다."))
-    else:
-        checks.append(FeasibilityCheck("note", "재건축 비용 구조", "재건축은 기본적으로 주거이전비·영업손실보상비를 자동 적용하지 않았습니다."))
-    return checks
 
 
 def build_feasibility_checks(
@@ -1591,6 +1660,20 @@ def normalize_cleanup_source_rows(project: AutofillProjectData) -> list[SourceRe
     return rows
 
 
+def hydrate_cleanup_observations(project: AutofillProjectData) -> AutofillProjectData:
+    attach_observed(project, "site_area_sqm", project.site_area_sqm, "official_cleanup", 0.88)
+    attach_observed(project, "target_building_coverage_ratio", project.target_building_coverage_ratio, "official_cleanup", 0.86)
+    attach_observed(project, "target_far", project.target_far, "official_cleanup", 0.86)
+    attach_observed(project, "current_households", project.current_households or project.owner_count, "official_cleanup", 0.86)
+    attach_observed(project, "planned_households", project.planned_households, "official_cleanup", 0.82)
+    attach_observed(project, "sale_households_total", project.sale_households_total, "official_cleanup", 0.80)
+    attach_observed(project, "sale_households", project.sale_households, "official_cleanup", 0.80)
+    attach_observed(project, "rental_households", project.rental_households, "official_cleanup", 0.80)
+    attach_observed(project, "public_facility_area_sqm", project.public_facility_area_sqm, "official_cleanup", 0.78)
+    attach_observed(project, "donation_area_sqm", project.donation_area_sqm, "official_cleanup", 0.76)
+    return project
+
+
 @cache_data(ttl=60 * 60, show_spinner=False)
 def cleanup_fetch_project_summary(project_slug: str) -> AutofillProjectData | None:
     if not project_slug:
@@ -1658,7 +1741,11 @@ def cleanup_fetch_project_summary(project_slug: str) -> AutofillProjectData | No
     )
     project.schedule_text = cleanup_fetch_schedule_text(cafe_id)
     project.source_records = normalize_cleanup_source_rows(project)
-    return project
+    project.search_source = "official_cleanup"
+    project.external_links.append(("서울 공식 사업개요", summary_url))
+    if project.source_url:
+        project.external_links.append(("서울 공식 메인", project.source_url))
+    return hydrate_cleanup_observations(project)
 
 
 @cache_data(ttl=60 * 60, show_spinner=False)
@@ -1676,6 +1763,231 @@ def cleanup_fetch_schedule_text(cafe_id: str) -> str | None:
     content_tokens = [token for token in tokens if token not in {"향후일정", "전체", "건이 검색되었습니다.", "일정", "내용"}]
     if len(content_tokens) > 6:
         return " / ".join(content_tokens[5:11])
+    return None
+
+
+class CleanupAdapter:
+    source = "official_cleanup"
+
+    def search(self, query: str) -> list[SearchResult]:
+        return [
+            SearchResult(
+                source=self.source,
+                project_id=item.project_slug,
+                title=item.project_name,
+                subtitle=" / ".join(part for part in [item.district, item.business_type, item.progress_stage or "단계 미확인"] if part),
+                url=item.source_url,
+                confidence=0.88,
+            )
+            for item in cleanup_search_projects(query)
+        ]
+
+    def fetch(self, project_id: str) -> AutofillProjectData | None:
+        return cleanup_fetch_project_summary(project_id)
+
+
+def parse_naver_search_links(html_text: str) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    for match in re.finditer(r'href="(?P<href>/complexes/\d+[^"]*)".{0,240}?>(?P<label>[^<]+)</a>', html_text, re.S):
+        href = unescape(match.group("href"))
+        title = unescape(re.sub(r"\s+", " ", match.group("label"))).strip()
+        if not title:
+            continue
+        results.append(
+            SearchResult(
+                source="naver_land",
+                project_id=urllib.parse.urljoin("https://fin.land.naver.com", href),
+                title=title,
+                subtitle="네이버 부동산 공개 단지 페이지",
+                url=urllib.parse.urljoin("https://fin.land.naver.com", href),
+                confidence=0.40,
+            )
+        )
+    return results
+
+
+def naver_extract_metric(tokens: list[str], key: str, suffix: str = "") -> str | None:
+    for idx, token in enumerate(tokens[:-1]):
+        compact = re.sub(r"\s+", "", token)
+        if compact == key and idx + 1 < len(tokens):
+            value = tokens[idx + 1]
+            if suffix and suffix not in value:
+                continue
+            return value
+    return None
+
+
+@cache_data(ttl=60 * 30, show_spinner=False)
+def naver_search_projects(query: str) -> list[SearchResult]:
+    keyword = query.strip()
+    if not keyword:
+        return []
+    url = f"https://fin.land.naver.com/search?q={urllib.parse.quote(keyword)}"
+    try:
+        html_text = fetch_html(url)
+    except urllib.error.URLError:
+        return []
+    results = parse_naver_search_links(html_text)
+    if results:
+        return results[:8]
+    return [
+        SearchResult(
+            source="naver_land",
+            project_id=url,
+            title=f"{keyword} 네이버 공개 검색",
+            subtitle="공개 검색 페이지를 보조 링크로 제공합니다.",
+            url=url,
+            confidence=0.18,
+        )
+    ]
+
+
+@cache_data(ttl=60 * 30, show_spinner=False)
+def naver_fetch_project_summary(project_id: str) -> AutofillProjectData | None:
+    if not project_id:
+        return None
+    try:
+        html_text = fetch_html(project_id)
+    except urllib.error.URLError:
+        return None
+    tokens = extract_text_tokens(html_text)
+    title_match = re.search(r"<title>(.*?)</title>", html_text, re.S | re.I)
+    raw_title = unescape(title_match.group(1)).strip() if title_match else project_id
+    project_name = raw_title.split(":")[0].split("-")[0].strip() or "네이버 공개 페이지"
+    project = AutofillProjectData(
+        query=project_name,
+        project_name=project_name,
+        district="",
+        business_type="",
+        project_kind=None,
+        progress_stage=None,
+        source_url=project_id,
+        search_source="naver_land",
+    )
+    project.external_links.append(("네이버 부동산 공개 페이지", project_id))
+    project.current_households = parse_int(naver_extract_metric(tokens, "총세대수", "세대"))
+    project.target_far = parse_float(naver_extract_metric(tokens, "용적률", "%"))
+    project.target_building_coverage_ratio = parse_float(naver_extract_metric(tokens, "건폐율", "%"))
+    attach_observed(project, "current_households", project.current_households, "naver_land", 0.54)
+    attach_observed(project, "target_far", project.target_far, "naver_land", 0.50)
+    attach_observed(project, "target_building_coverage_ratio", project.target_building_coverage_ratio, "naver_land", 0.50)
+    if project.current_households is not None:
+        project.source_records.append(record("current_households", str(project.current_households), "naver_land", 0.54))
+    if project.target_far is not None:
+        project.source_records.append(record("target_far", f"{project.target_far:.1f}", "naver_land", 0.50))
+    if project.target_building_coverage_ratio is not None:
+        project.source_records.append(record("building_coverage_ratio", f"{project.target_building_coverage_ratio:.1f}", "naver_land", 0.50))
+    return project
+
+
+class NaverComplexAdapter:
+    source = "naver_land"
+
+    def search(self, query: str) -> list[SearchResult]:
+        return naver_search_projects(query)
+
+    def fetch(self, project_id: str) -> AutofillProjectData | None:
+        return naver_fetch_project_summary(project_id)
+
+
+@cache_data(ttl=60 * 30, show_spinner=False)
+def kgeop_search_projects(query: str) -> list[SearchResult]:
+    keyword = query.strip()
+    if not keyword:
+        return []
+    url = "https://kgeop.go.kr/info/infoMap.do?initMode=L"
+    return [
+        SearchResult(
+            source="kgeop_public",
+            project_id=url,
+            title=f"{keyword} KGeoP 공개 지도",
+            subtitle="필지/지목/위치 정합성 확인용 보조 링크",
+            url=url,
+            confidence=0.12,
+        )
+    ]
+
+
+@cache_data(ttl=60 * 30, show_spinner=False)
+def kgeop_fetch_project_summary(project_id: str) -> AutofillProjectData | None:
+    if not project_id:
+        return None
+    project = AutofillProjectData(
+        query="",
+        project_name="KGeoP 공개 지도",
+        district="",
+        business_type="",
+        project_kind=None,
+        progress_stage=None,
+        source_url=project_id,
+        search_source="kgeop_public",
+    )
+    project.external_links.append(("KGeoP 공개 지도", project_id))
+    project.source_records.append(record("parser_status", "unsupported", "kgeop_public", 0.10, "공개 페이지는 보조 확인 링크로만 제공합니다."))
+    return project
+
+
+class KGeoPAdapter:
+    source = "kgeop_public"
+
+    def search(self, query: str) -> list[SearchResult]:
+        return kgeop_search_projects(query)
+
+    def fetch(self, project_id: str) -> AutofillProjectData | None:
+        return kgeop_fetch_project_summary(project_id)
+
+
+def merge_autofill_projects(*projects: AutofillProjectData | None) -> AutofillProjectData | None:
+    available = [project for project in projects if project is not None]
+    if not available:
+        return None
+    base = available[0]
+    for candidate in available[1:]:
+        if not candidate:
+            continue
+        for field_name, observed_value in candidate.observed_fields.items():
+            base.observed_fields[field_name] = choose_observed_value(base.observed_fields.get(field_name), observed_value) or observed_value
+        base.external_links = merge_external_links(base, candidate)
+        if not base.project_name and candidate.project_name:
+            base.project_name = candidate.project_name
+        if not base.source_url and candidate.source_url:
+            base.source_url = candidate.source_url
+        base.source_records.extend(candidate.source_records)
+    for field_name, observed_value in base.observed_fields.items():
+        try:
+            setattr(base, field_name, observed_value.value)
+        except Exception:
+            continue
+    return base
+
+
+def search_all_projects(query: str, include_external: bool) -> list[SearchResult]:
+    adapters: list[SearchAdapter] = [CleanupAdapter()]
+    if include_external:
+        adapters.extend([NaverComplexAdapter(), KGeoPAdapter()])
+    results: list[SearchResult] = []
+    seen: set[tuple[str, str]] = set()
+    for adapter in adapters:
+        try:
+            found = adapter.search(query)
+        except Exception:
+            continue
+        for item in found:
+            key = (item.source, item.project_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(item)
+    return results[:18]
+
+
+def fetch_project_from_search_result(result: SearchResult) -> AutofillProjectData | None:
+    if result.source == "official_cleanup":
+        return CleanupAdapter().fetch(result.project_id)
+    if result.source == "naver_land":
+        return NaverComplexAdapter().fetch(result.project_id)
+    if result.source == "kgeop_public":
+        return KGeoPAdapter().fetch(result.project_id)
     return None
 
 
@@ -1771,10 +2083,14 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
         profile_name=quick_inputs.scenario_profile,
         scenario_name=scenario_name,
     )
-    base_sale_rate = quick_inputs.sale_rate if quick_inputs.sale_rate is not None else scenario["sale_rate"]
-    base_cash_rate = quick_inputs.cash_settlement_rate if quick_inputs.cash_settlement_rate is not None else scenario["cash_settlement_rate"]
-    base_cost_per_pyeong = quick_inputs.construction_cost_per_pyeong or scenario["construction_cost_per_pyeong"]
-    base_pf_rate = quick_inputs.pf_rate or scenario["pf_rate"]
+    sale_rate_baseline = quick_inputs.sale_rate if quick_inputs.sale_rate is not None else SCENARIOS[BASELINE_SCENARIO_NAME]["sale_rate"]
+    cash_rate_baseline = quick_inputs.cash_settlement_rate if quick_inputs.cash_settlement_rate is not None else SCENARIOS[BASELINE_SCENARIO_NAME]["cash_settlement_rate"]
+    construction_cost_baseline = quick_inputs.construction_cost_per_pyeong or SCENARIOS[BASELINE_SCENARIO_NAME]["construction_cost_per_pyeong"]
+    pf_rate_baseline = quick_inputs.pf_rate or SCENARIOS[BASELINE_SCENARIO_NAME]["pf_rate"]
+    base_sale_rate = apply_scenario_to_baseline(sale_rate_baseline, scenario_name, "sale_rate", low=0.0, high=1.0)
+    base_cash_rate = apply_scenario_to_baseline(cash_rate_baseline, scenario_name, "cash_settlement_rate", low=0.0, high=0.40)
+    base_cost_per_pyeong = apply_scenario_to_baseline(construction_cost_baseline, scenario_name, "construction_cost_per_pyeong", low=1_000_000.0, high=30_000_000.0)
+    base_pf_rate = apply_scenario_to_baseline(pf_rate_baseline, scenario_name, "pf_rate", low=0.0, high=0.30)
     simulation = simulate_project_plan(quick_inputs, advanced_inputs, base_cash_rate, profile)
     pf_financing_ratio = clamp(advanced_inputs.pf_financing_ratio, 0.0, 0.95)
     pf_interest_months = max(advanced_inputs.pf_interest_months, 0.0)
@@ -2257,6 +2573,8 @@ def analyze_scenario(quick_inputs: QuickDealInputs, advanced_inputs: AdvancedPro
             "average_move_loan_amount": average_move_loan_amount,
             "move_loan_duration_months": move_loan_duration_months,
             "member_sale_price_ratio": member_sale_price_ratio,
+            "general_sale_price_basis_exclusive_area": quick_inputs.general_sale_price_basis_exclusive_area or 84.0,
+            "general_sale_price_per_pyeong_manwon": quick_inputs.general_sale_price_per_pyeong_manwon or 0.0,
             "rental_sale_price_per_pyeong_manwon": rental_sale_price_per_pyeong_manwon,
         },
         summary_lines=summary_lines,
@@ -2414,16 +2732,65 @@ def render_source_records(records: list[SourceRecord], title: str) -> None:
 def render_project_autofill(project: AutofillProjectData | None) -> None:
     if st is None or not project:
         return
-    st.markdown(
+    badge_text = {
+        "official_cleanup": source_badge("서울 공식값 채택", "ok"),
+        "naver_land": source_badge("네이버 공개값", "base"),
+        "kgeop_public": source_badge("KGeoP 확인 링크", "warn"),
+    }
+    external_links = "".join(
+        f"<li><a href='{escape(url)}' target='_blank'>{escape(label)}</a></li>"
+        for label, url in project.external_links[:4]
+        if url
+    )
+    card_html = (
         "<div class='section-card'>"
         f"<div class='soft-title'>{escape(project.project_name)}</div>"
-        f"<div>{source_badge('서울 공식값 사용', 'ok')}{source_badge(project.business_type or '사업유형 미확인')}{source_badge((project.project_kind.value if project.project_kind else '유형 미확인'), 'base')}</div>"
+        f"<div>{badge_text.get(project.search_source, source_badge('자동조회', 'base'))}{source_badge(project.business_type or '사업유형 미확인')}{source_badge((project.project_kind.value if project.project_kind else '유형 미확인'), 'base')}</div>"
         f"<p class='mini-note'>대표지번: {escape(project.representative_lot or '-')} / 조합원·권리자 수: {project.current_households or project.owner_count or '-'} / 계획 세대수: {project.planned_households or '-'}</p>"
         f"<p class='mini-note'>목표 건폐율: {project.target_building_coverage_ratio or '-'}% / 목표 용적률: {project.target_far or '-'}% / 분양주택: {project.sale_households_total or '-'}세대 / 추정 일반분양: {project.sale_households or '-'}세대 / 임대: {project.rental_households or '-'}세대</p>"
-        f"<p class='mini-note'>공공시설 반영면적: {project.public_facility_area_sqm or '-'}㎡ / 명시 기부채납: {project.donation_area_sqm or '-'}㎡ / 출처: 서울 정비사업 정보몽땅</p>"
-        "</div>",
+        f"<p class='mini-note'>공공시설 반영면적: {project.public_facility_area_sqm or '-'}㎡ / 명시 기부채납: {project.donation_area_sqm or '-'}㎡ / 출처: {humanize_source(project.search_source)}</p>"
+        + (f"<div class='mini-note' style='margin-top:8px;'><strong>외부 확인 링크</strong><ul style='margin:6px 0 0 18px;'>{external_links}</ul></div>" if external_links else "")
+        + "</div>"
+    )
+    st.markdown(
+        card_html,
         unsafe_allow_html=True,
     )
+
+
+def core_result_rows(result: QuickResult) -> list[dict[str, str]]:
+    upsize_text = "-"
+    if result.upsize_allocation is not None:
+        upsize_text = fmt_settlement(float(result.upsize_allocation["예상 추가분담금"]))
+    return [
+        {
+            "추천 평형 정산액": fmt_settlement(result.additional_cash_needed),
+            "한 단계 확장": upsize_text,
+            "손익분기 매수가": fmt_money(result.break_even_purchase_price),
+            "일반분양 세대수": f"{result.simulation_result.general_sale_households:,}세대",
+            "신뢰도": f"{result.confidence_report.label} ({result.confidence_report.total:.1f}점)",
+        }
+    ]
+
+
+def why_rows(result: QuickResult) -> list[dict[str, str]]:
+    price_mode = (
+        f"공급평당가 우선 ({result.assumption_summary['general_sale_price_per_pyeong_manwon']:,.0f}만원/평)"
+        if result.assumption_summary.get("general_sale_price_per_pyeong_manwon")
+        else f"기준 전용 총액 앵커 ({result.assumption_summary.get('general_sale_price_basis_exclusive_area', 84.0):.0f}㎡ 기준)"
+    )
+    return [
+        {"구분": "수입", "항목": "총수입", "값": fmt_money(result.project_summary["총수입"])},
+        {"구분": "수입", "항목": "임대주택수입", "값": fmt_money(result.project_summary["임대주택수입"])},
+        {"구분": "지출", "항목": "총지출", "값": fmt_money(result.project_summary["총지출"])},
+        {"구분": "지출", "항목": "본공사비", "값": fmt_money(result.project_summary["본공사비"])},
+        {"구분": "지출", "항목": "금융비", "값": fmt_money(result.project_summary["금융비"])},
+        {"구분": "가정", "항목": "조합원 분양가율", "값": fmt_pct(result.assumption_summary["member_sale_price_ratio"])},
+        {"구분": "가정", "항목": "일반분양가 기준", "값": price_mode},
+        {"구분": "가정", "항목": "PF / 이주비", "값": f"PF {fmt_pct(result.assumption_summary['pf_rate'])}, {result.assumption_summary['pf_interest_months']:.0f}개월 / 이주비 {fmt_money(result.assumption_summary['average_move_loan_amount'])}"},
+        {"구분": "가정", "항목": "자동추정 요약", "값": f"일반분양 {result.simulation_result.general_sale_households:,}세대 / 임대 {result.simulation_result.rental_households:,}세대 / 기부채납 {fmt_pct(result.simulation_result.donation_ratio)}"},
+        {"구분": "가정", "항목": "임대수입 기준", "값": f"평당 {result.assumption_summary['rental_sale_price_per_pyeong_manwon']:,.0f}만원"},
+    ]
 
 
 def project_summary_rows(result: QuickResult) -> list[dict[str, str]]:
@@ -2519,11 +2886,45 @@ def scenario_overview_rows(results: list[QuickResult]) -> list[dict[str, str]]:
                 "추천 평형 정산액": fmt_settlement(result.additional_cash_needed),
                 "한 단계 확장": upsize_text,
                 "손익분기 매수가": fmt_money(result.break_even_purchase_price),
+                "기준 대비": result.scenario_delta_summary or "-",
                 "일반분양 세대수": f"{result.simulation_result.general_sale_households:,}세대",
+                "시나리오 가정": f"분양률 {fmt_pct(result.assumption_summary['sale_rate'])} / 공사비 {result.assumption_summary['construction_cost_per_pyeong'] / 10_000:,.0f}만원/평 / PF {fmt_pct(result.assumption_summary['pf_rate'])} / 기간 {result.remaining_months / 12:.1f}년",
                 "신뢰도": f"{result.confidence_report.label} ({result.confidence_report.total:.1f}점)",
             }
         )
     return rows
+
+
+def annotate_scenario_results(results: list[QuickResult]) -> tuple[bool, str]:
+    baseline = next((item for item in results if item.scenario_name == BASELINE_SCENARIO_NAME), results[0] if results else None)
+    if baseline is None:
+        return False, ""
+    max_break_even_delta = 0.0
+    max_settlement_delta = 0.0
+    for result in results:
+        delta_parts: list[str] = []
+        if result.break_even_purchase_price and baseline.break_even_purchase_price:
+            break_even_delta = result.break_even_purchase_price - baseline.break_even_purchase_price
+            max_break_even_delta = max(max_break_even_delta, abs(break_even_delta))
+            if result is baseline:
+                delta_parts.append("기준 입력값")
+            elif abs(break_even_delta) >= 10_000_000:
+                delta_parts.append(f"매수가 {break_even_delta / 100_000_000:+.2f}억")
+        if result.additional_cash_needed is not None and baseline.additional_cash_needed is not None:
+            settlement_delta = result.additional_cash_needed - baseline.additional_cash_needed
+            max_settlement_delta = max(max_settlement_delta, abs(settlement_delta))
+            if result is not baseline and abs(settlement_delta) >= 10_000_000:
+                delta_parts.append(f"정산액 {settlement_delta / 100_000_000:+.2f}억")
+        result.scenario_delta_summary = " / ".join(delta_parts) if delta_parts else ("기준 입력값" if result is baseline else "차이 작음")
+    visible = max_break_even_delta >= 30_000_000 or max_settlement_delta >= 20_000_000
+    for result in results:
+        result.scenario_visibility = visible
+    summary = (
+        f"기준 대비 최대 손익분기 매수가 차이는 {max_break_even_delta / 100_000_000:.2f}억, 정산액 차이는 {max_settlement_delta / 100_000_000:.2f}억입니다."
+        if visible
+        else "현재 입력에서는 낙관·기준·보수 시나리오 차이가 작아서 표를 접어도 될 정도입니다."
+    )
+    return visible, summary
 
 
 def summarize_document_state(parsed_notice: ParsedProjectNotice | None) -> list[str]:
@@ -2545,26 +2946,10 @@ def summarize_document_state(parsed_notice: ParsedProjectNotice | None) -> list[
 def render_result_summary(result: QuickResult) -> None:
     if st is None:
         return
-    recommended_label = "대표 평형 추정"
-    recommended_sub = f"예상 {result.remaining_months / 12:.1f}년"
-    if result.selected_allocation is not None:
-        recommended_label = str(result.selected_allocation["평형"])
-        recommended_sub = f"커버율 {fmt_pct(float(result.selected_allocation['커버율']))}"
-    upsize_value = "-"
-    upsize_sub = "확장 평형 없음"
-    if result.upsize_allocation is not None:
-        upsize_value = fmt_settlement(float(result.upsize_allocation["예상 추가분담금"]))
-        area_delta = float(result.upsize_allocation["전용㎡"]) - result.current_unit_exclusive_area
-        upsize_sub = f"{result.upsize_allocation['평형']} / +{area_delta:.1f}㎡"
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("추천 평형 정산액", fmt_settlement(result.additional_cash_needed), f"{recommended_label} / {recommended_sub}")
-    c2.metric("한 단계 넓히면", upsize_value, upsize_sub)
-    c3.metric("손익분기 매수가", fmt_money(result.break_even_purchase_price), "세후 0원 기준")
-    c4.metric("예상 시간비용", fmt_money(result.time_cost_to_exit), "보유비용 + 자금이자")
-    c5.metric("준공 직후 세후순이익", fmt_money(float(result.selected_exit["세후 순이익"])), "ROI는 하단 시나리오 표 참고")
-    c6.metric("신뢰도", result.confidence_report.label, f"{result.confidence_report.total:.1f}점")
-    for line in result.summary_lines:
+    st.markdown("<div class='section-card'><div class='soft-title'>핵심 요약</div></div>", unsafe_allow_html=True)
+    for line in result.summary_lines[:3]:
         st.markdown(f"<div class='result-blurb'>{escape(line)}</div>", unsafe_allow_html=True)
+    render_table(core_result_rows(result), "핵심 결과")
 
 
 def render_input_guide(project_kind: ProjectKind) -> None:
@@ -2610,15 +2995,20 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    with st.sidebar:
-        st.header("계산 모드")
-        calc_mode = st.radio("작업 방식", ["빠른 검토", "정밀 계산"], horizontal=False)
-        scenario_focus = st.selectbox("화면 기준 시나리오", list(SCENARIOS.keys()), index=1)
-        assumption_profile = st.select_slider("초보자 가정 프리셋", options=list(ASSUMPTION_PROFILES.keys()), value="기준")
-        st.caption("기부채납, 임대비율, 일반분양비율을 잘 모르면 `기준`으로 두고 먼저 본 뒤 필요할 때만 수정하세요.")
-        lookup_enabled = st.checkbox("서울 공식값 자동조회 사용", value=True)
-        aggressive_upsize = st.checkbox("공격적 평형 업사이즈 허용", value=False)
-        uploaded_files = st.file_uploader("문서 업로드", type=["pdf", "csv"], accept_multiple_files=True)
+    scenario_focus = BASELINE_SCENARIO_NAME
+    st.markdown("### 1. 프로젝트 찾기")
+    with st.expander("계산 설정", expanded=False):
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            calc_mode = st.radio("작업 방식", ["빠른 검토", "정밀 계산"], horizontal=True)
+            assumption_profile = st.select_slider("가정 프리셋", options=list(ASSUMPTION_PROFILES.keys()), value="기준")
+        with s2:
+            lookup_enabled = st.checkbox("서울 공식값 자동조회", value=True)
+            use_external_lookup = st.checkbox("외부 소스 추가조회", value=False)
+        with s3:
+            aggressive_upsize = st.checkbox("공격적 평형 업사이즈 허용", value=False)
+            uploaded_files = st.file_uploader("문서 업로드", type=["pdf", "csv"], accept_multiple_files=True)
+        st.caption("기부채납, 임대비율, 일반분양비율을 잘 모르면 `기준` 프리셋으로 먼저 보고 필요할 때만 자동값을 수정하세요.")
 
     parsed_notices: list[ParsedProjectNotice] = []
     if uploaded_files:
@@ -2627,25 +3017,33 @@ def main() -> None:
     merged_notice = merge_notices(parsed_notices)
 
     autofill_project: AutofillProjectData | None = None
+    search_query = ""
     if lookup_enabled:
-        with st.expander("서울 공식값 자동조회", expanded=True):
-            st.caption("서울 정비사업 정보몽땅에서 사업장명으로 조회합니다. 주소는 안 넣어도 됩니다.")
-            search_query = st.text_input("서울 사업장명 검색", value="")
-            search_results = cleanup_search_projects(search_query) if search_query.strip() else []
-            if search_query and not search_results:
-                st.warning("일치하는 서울 사업장을 찾지 못했습니다. 아래 수동 입력으로 계속 진행할 수 있습니다.")
-            if search_results:
-                labels = [f"{item.project_name} / {item.district} / {item.progress_stage or '단계 미확인'}" for item in search_results]
-                selected_label = st.selectbox("검색 결과", labels)
-                selected_project = search_results[labels.index(selected_label)]
-                fetched = cleanup_fetch_project_summary(selected_project.project_slug)
-                if fetched:
-                    fetched.progress_stage = selected_project.progress_stage
-                    fetched.project_name = selected_project.project_name or fetched.project_name
-                    fetched.district = selected_project.district or fetched.district
-                    fetched.representative_lot = selected_project.representative_lot or fetched.representative_lot
-                    autofill_project = fetched
-                    render_project_autofill(autofill_project)
+        st.caption("서울 공식값은 기본 자동조회로 두고, 외부 소스 추가조회를 켜면 네이버/KGeoP 공개 페이지를 보조 링크로만 함께 붙입니다.")
+        search_query = st.text_input("프로젝트명 또는 단지명 검색", value="", placeholder="예: 방화6, 우면한라, 개포주공")
+        search_results = search_all_projects(search_query, use_external_lookup) if search_query.strip() else []
+        if search_query and not search_results:
+            st.warning("일치하는 공개 검색 결과를 찾지 못했습니다. 아래 수동 입력으로 계속 진행할 수 있습니다.")
+        if search_results:
+            labels = [f"[{humanize_source(item.source)}] {item.title} / {item.subtitle}" for item in search_results]
+            selected_label = st.selectbox("검색 결과", labels)
+            selected_result = search_results[labels.index(selected_label)]
+            primary_project = fetch_project_from_search_result(selected_result)
+            supplemental_projects: list[AutofillProjectData | None] = []
+            if use_external_lookup and selected_result.source == "official_cleanup":
+                for item in search_results:
+                    if item.source == "official_cleanup":
+                        continue
+                    supplemental_projects.append(fetch_project_from_search_result(item))
+            autofill_project = merge_autofill_projects(primary_project, *supplemental_projects)
+            if autofill_project:
+                cleanup_hit = next((item for item in cleanup_search_projects(search_query) if item.project_slug == selected_result.project_id), None) if selected_result.source == "official_cleanup" else None
+                if cleanup_hit:
+                    autofill_project.progress_stage = cleanup_hit.progress_stage or autofill_project.progress_stage
+                    autofill_project.project_name = cleanup_hit.project_name or autofill_project.project_name
+                    autofill_project.district = cleanup_hit.district or autofill_project.district
+                    autofill_project.representative_lot = cleanup_hit.representative_lot or autofill_project.representative_lot
+                render_project_autofill(autofill_project)
 
     extracted_options = []
     if merged_notice:
@@ -2679,7 +3077,8 @@ def main() -> None:
     land_based_reconstruction = reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER
     if autofill_project and autofill_project.project_kind and autofill_project.project_kind != project_kind:
         st.warning(f"서울 공식 사업유형은 `{autofill_project.project_kind.value}`입니다. 지금 `{project_kind.value}` 모드로 계산하면 수익성과 정산액이 크게 왜곡될 수 있습니다.")
-    render_input_guide(project_kind)
+    with st.expander("입력 가이드", expanded=False):
+        render_input_guide(project_kind)
     if land_based_reconstruction:
         st.caption("단독주택 묶음형 재건축은 아파트 평형보다 대지지분과 권리자 수가 더 중요해서, 입력 화면과 정산액 로직을 토지형으로 전환합니다.")
     redevelopment_base_exclusive_area = 59.0
@@ -2890,15 +3289,19 @@ def main() -> None:
         )
 
         st.markdown("#### 자동 제안값")
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("총세대수", f"{preview_simulation.planned_households:,}세대", humanize_source(preview_simulation.sources["households"]))
-        p2.metric("일반분양", f"{preview_simulation.general_sale_households:,}세대", fmt_pct(preview_simulation.general_sale_ratio))
-        p3.metric("기부채납", fmt_pct(preview_simulation.donation_ratio), humanize_source(preview_simulation.sources["donation_ratio"]))
-        p4.metric("임대주택", f"{preview_simulation.rental_households:,}세대", fmt_pct(preview_simulation.rental_ratio))
-        if preview_simulation.required_avg_floors is not None:
-            p5.metric("필요 평균층수", f"{preview_simulation.required_avg_floors:.1f}층", f"남은 {preview_remaining_months / 12:.1f}년")
-        else:
-            p5.metric("필요 평균층수", "-", f"남은 {preview_remaining_months / 12:.1f}년")
+        render_table(
+            [
+                {
+                    "예상 총세대수": f"{preview_simulation.planned_households:,}세대",
+                    "일반분양": f"{preview_simulation.general_sale_households:,}세대 ({fmt_pct(preview_simulation.general_sale_ratio)})",
+                    "임대주택": f"{preview_simulation.rental_households:,}세대 ({fmt_pct(preview_simulation.rental_ratio)})",
+                    "기부채납": fmt_pct(preview_simulation.donation_ratio),
+                    "필요 평균층수": f"{preview_simulation.required_avg_floors:.1f}층" if preview_simulation.required_avg_floors is not None else "-",
+                    "남은 기간": f"{preview_remaining_months / 12:.1f}년",
+                }
+            ],
+            "자동 제안 요약",
+        )
 
         st.markdown("#### 자동값 직접 수정")
         o1, o2, o3, o4 = st.columns(4)
@@ -3134,55 +3537,42 @@ def main() -> None:
     )
 
     results = [analyze_scenario(quick_inputs, advanced_inputs, scenario_name, detail_allowed) for scenario_name in SCENARIOS]
+    scenario_visible, scenario_summary = annotate_scenario_results(results)
     focus_result = next(item for item in results if item.scenario_name == scenario_focus)
 
-    st.subheader("결과")
+    st.markdown("### 4. 결과")
     if not quick_inputs.lookup_enabled:
         st.warning("서울 공식값을 못 불러온 상태라 일부 값은 수동 입력과 휴리스틱으로 계산됩니다.")
     if detail_allowed and focus_result.old_asset_source == "purchase_price_heuristic":
         st.warning("정밀계산용 참고가격이 없어서 권리가액은 매수가 기반 휴리스틱으로 추정했습니다.")
     render_result_summary(focus_result)
+    render_table(why_rows(focus_result), "왜 이렇게 계산됐는지")
+    render_table(feasibility_rows(focus_result), "왜곡 위험 점검")
 
-    tab1, tab2, tab3 = st.tabs(["핵심 결과", "시나리오/민감도", "정밀 근거"])
-    with tab1:
-        render_table(scenario_overview_rows(results), "시나리오 한눈에 보기")
-        left, right = st.columns([1.1, 0.9])
-        with left:
-            render_table(project_summary_rows(focus_result), "사업성 요약")
-        with right:
-            render_table(feasibility_rows(focus_result), "세대수/층수 점검")
+    with st.expander("시나리오 비교", expanded=scenario_visible):
+        if scenario_visible:
+            st.caption(scenario_summary)
+            render_table(scenario_overview_rows(results), "시나리오 한눈에 보기")
+        else:
+            st.info(scenario_summary)
+
+    with st.expander("자동 추정과 공식값 반영", expanded=False):
         render_table(simulation_rows(focus_result), "자동 추정과 공식값 반영")
-        left, right = st.columns([1.1, 0.9])
-        with left:
-            if focus_result.allocation_options:
-                if not detail_allowed:
-                    st.caption("관리처분 이전 단계에서는 권리가액과 분양가표가 개략치이므로, 아래 정산액은 빠른 검토용 시뮬레이션으로 보세요.")
-                render_table(allocation_rows(focus_result), "평형별 정산액 시뮬레이션")
-            else:
-                st.markdown(
-                    "<div class='section-card'><div class='soft-title'>평형별 정산액 시뮬레이션</div><p class='mini-note'>현재 입력값으로는 평형별 정산액 시뮬레이션을 만들기 어려웠습니다. 일반분양 평균가나 예상 새 전용면적을 한 번 더 확인해 주세요.</p></div>",
-                    unsafe_allow_html=True,
-                )
-        with right:
-            assumption_rows = [
-                {"가정값": "일반분양 판매율", "값": fmt_pct(focus_result.assumption_summary["sale_rate"])},
-                {"가정값": "현금청산률", "값": fmt_pct(focus_result.assumption_summary["cash_settlement_rate"])},
-                {"가정값": "기부채납 비율", "값": fmt_pct(focus_result.assumption_summary["donation_ratio"])},
-                {"가정값": "임대주택 비율", "값": fmt_pct(focus_result.assumption_summary["rental_ratio"])},
-                {"가정값": "일반분양 비율", "값": fmt_pct(focus_result.assumption_summary["general_sale_ratio"])},
-                {"가정값": "PF 금리", "값": fmt_pct(focus_result.assumption_summary["pf_rate"])},
-                {"가정값": "PF 조달비율", "값": fmt_pct(focus_result.assumption_summary["pf_financing_ratio"])},
-                {"가정값": "PF 이자 반영기간", "값": f"{focus_result.assumption_summary['pf_interest_months']:.0f}개월"},
-                {"가정값": "세대당 평균 이주비", "값": fmt_money(focus_result.assumption_summary["average_move_loan_amount"])},
-                {"가정값": "이주비 대여기간", "값": f"{focus_result.assumption_summary['move_loan_duration_months']:.0f}개월"},
-            ]
-            render_table(assumption_rows, "이번 계산에 들어간 핵심 가정")
+        render_table(project_summary_rows(focus_result), "사업수지 요약")
 
-    with tab2:
+    with st.expander("평형별 정산액 시뮬레이션", expanded=bool(focus_result.allocation_options)):
+        if focus_result.allocation_options:
+            if not detail_allowed:
+                st.caption("관리처분 이전 단계에서는 권리가액과 분양가표가 개략치이므로, 아래 정산액은 빠른 검토용 시뮬레이션으로 보세요.")
+            render_table(allocation_rows(focus_result), "평형별 정산액 시뮬레이션")
+        else:
+            st.info("현재 입력값으로는 평형별 정산액 시뮬레이션을 만들기 어려웠습니다. 일반분양 평균가나 예상 새 전용면적을 한 번 더 확인해 주세요.")
+
+    with st.expander("엑시트와 민감도", expanded=False):
         render_table(exit_rows(focus_result), "엑시트별 손익")
         render_table(focus_result.sensitivity_rows, "민감도")
 
-    with tab3:
+    with st.expander("정밀 근거와 비용 버킷", expanded=False):
         render_table(bucket_rows(focus_result), "비용 버킷")
         if detail_allowed and focus_result.advanced_rights_result is not None:
             detail_rows = [
@@ -3196,7 +3586,7 @@ def main() -> None:
         if merged_notice:
             render_source_records(merged_notice.extracted_records, "문서 추출 결과")
         if autofill_project:
-            render_source_records(autofill_project.source_records, "서울 공식값 반영 결과")
+            render_source_records(autofill_project.source_records, "자동조회 반영 결과")
 
     st.caption("권리가액, 분담금, 공사비, 일정은 법적 확정값이 아니라 의사결정 보조용 추정치입니다. 특히 관리처분인가 이전 단계에서는 빠른 매물 검토용 개략치로 보는 것이 안전합니다.")
 
