@@ -278,6 +278,9 @@ class UnionPlanPreview:
     current_gross_floor_area_sqm: float
     gross_floor_area_sqm: float
     average_supply_area_sqm: float
+    average_exclusive_area_sqm: float
+    residential_efficiency: float
+    residential_efficiency_source: str
     planned_households: int
     planned_households_source: str
     simulated_total_households: int
@@ -516,6 +519,100 @@ def weighted_average_supply_area(rows: list[UnitMixRow], default_supply_area: fl
     return safe_div(weighted_area, total_households, default_supply_area)
 
 
+def nearest_standard_size(target_size: float, sizes: list[float] | tuple[float, ...]) -> float:
+    if not sizes:
+        return float(target_size)
+    return float(min(sizes, key=lambda size: (abs(size - target_size), size)))
+
+
+def candidate_planned_sizes(
+    *,
+    project_kind: ProjectKind,
+    reconstruction_style: ReconstructionStyle,
+    average_exclusive: float,
+    expected_new_exclusive_area: float,
+) -> list[float]:
+    if uses_land_based_flow(project_kind, reconstruction_style):
+        return [59.0, 74.0, 84.0]
+    if average_exclusive >= 100.0 or expected_new_exclusive_area >= 101.0:
+        return [59.0, 84.0, 101.0, 114.0]
+    if average_exclusive >= 84.0 or expected_new_exclusive_area >= 84.0:
+        return [59.0, 74.0, 84.0, 101.0]
+    return [59.0, 74.0, 84.0]
+
+
+def project_member_target_size(existing_exclusive_area: float, expected_new_exclusive_area: float, sizes: list[float]) -> float:
+    growth_target = (float(existing_exclusive_area) * 1.18) + 6.0
+    minimum_target = max(59.0, min(float(expected_new_exclusive_area), max(sizes)) * 0.72)
+    projected_size = max(growth_target, minimum_target)
+    return nearest_standard_size(projected_size, sizes)
+
+
+def extra_sale_weights_from_member_mix(member_counts: list[int], sizes: list[float], expected_new_exclusive_area: float) -> list[float]:
+    total_members = max(sum(member_counts), 1)
+    sale_anchor = nearest_standard_size(max(float(expected_new_exclusive_area), min(sizes)), sizes)
+    smallest_size = min(sizes)
+    weights: list[float] = []
+    for size, count in zip(sizes, member_counts):
+        inherited_share = safe_div(count, total_members, 0.0)
+        bias = 0.10
+        if size == sale_anchor:
+            bias += 0.12
+        elif size < sale_anchor:
+            bias += 0.08
+        else:
+            bias += 0.04
+        if size == smallest_size:
+            bias += 0.02
+        weights.append((inherited_share * 0.55) + bias)
+    return weights
+
+
+def estimate_residential_efficiency(
+    *,
+    project_kind: ProjectKind,
+    reconstruction_style: ReconstructionStyle,
+    required_avg_floors: float | None,
+    target_bcr_pct: float | None,
+    current_far_pct: float | None,
+    target_far_pct: float,
+    average_exclusive_area_sqm: float,
+) -> tuple[float, str]:
+    if project_kind == ProjectKind.REDEVELOPMENT:
+        base_efficiency = 0.72
+    elif reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER:
+        base_efficiency = 0.70
+    else:
+        base_efficiency = 0.75
+
+    size_penalty = 0.0
+    if average_exclusive_area_sqm < 60.0:
+        size_penalty = clamp((60.0 - average_exclusive_area_sqm) / 20.0, 0.0, 1.0) * 0.03
+
+    floor_penalty = 0.0
+    if required_avg_floors is not None and required_avg_floors > 20.0:
+        floor_penalty += 0.03
+        if required_avg_floors > 25.0:
+            floor_penalty += clamp((required_avg_floors - 25.0) / 10.0, 0.0, 1.0) * 0.05
+        if required_avg_floors > 35.0:
+            floor_penalty += clamp((required_avg_floors - 35.0) / 10.0, 0.0, 1.0) * 0.03
+
+    bcr_penalty = 0.0
+    if target_bcr_pct is not None and target_bcr_pct > 0:
+        bcr_penalty = clamp((18.0 - target_bcr_pct) / 8.0, 0.0, 1.0) * 0.04
+
+    far_jump_penalty = 0.0
+    if current_far_pct is not None and current_far_pct > 0:
+        far_jump_ratio = target_far_pct / current_far_pct
+        if far_jump_ratio > 1.6:
+            far_jump_penalty = clamp((far_jump_ratio - 1.6) / 1.6, 0.0, 1.0) * 0.05
+    elif target_far_pct >= 300.0:
+        far_jump_penalty = 0.02
+
+    efficiency = clamp(base_efficiency - size_penalty - floor_penalty - bcr_penalty - far_jump_penalty, 0.52, 0.82)
+    return efficiency, "heuristic"
+
+
 def allocate_counts_by_weights(total_count: int, weights: list[float]) -> list[int]:
     if total_count <= 0 or not weights:
         return [0 for _ in weights]
@@ -648,30 +745,28 @@ def auto_planned_unit_mix_rows(inputs: UnionProjectInputs, planned_households: i
 
     default_exclusive = inputs.expected_new_exclusive_area or inputs.current_unit_exclusive_area
     average_exclusive = weighted_average_exclusive_area(inputs.existing_unit_mix_rows, default_exclusive)
-    if uses_land_based_flow(inputs.project_kind, inputs.reconstruction_style):
-        sizes = [59.0, 74.0, 84.0]
-    elif average_exclusive >= 100:
-        sizes = [59.0, 84.0, 101.0, 114.0]
-    elif average_exclusive >= 84:
-        sizes = [59.0, 74.0, 84.0, 101.0]
-    else:
-        sizes = [59.0, 74.0, 84.0]
+    sizes = candidate_planned_sizes(
+        project_kind=inputs.project_kind,
+        reconstruction_style=inputs.reconstruction_style,
+        average_exclusive=average_exclusive,
+        expected_new_exclusive_area=default_exclusive,
+    )
 
     if inputs.existing_unit_mix_rows and uses_apartment_reconstruction_flow(inputs.project_kind, inputs.reconstruction_style):
-        total_households = max(sum(item.households for item in inputs.existing_unit_mix_rows), 1)
-        small_share = sum(item.households for item in inputs.existing_unit_mix_rows if item.exclusive_area_sqm <= 60.0) / total_households
-        large_share = sum(item.households for item in inputs.existing_unit_mix_rows if item.exclusive_area_sqm >= 100.0) / total_households
-        if len(sizes) == 4:
-            mid_share = max(1.0 - small_share - large_share, 0.0)
-            weights = [
-                max(small_share, 0.18),
-                max(mid_share * 0.30, 0.12),
-                max(mid_share * 0.45, 0.20),
-                max(large_share, 0.10),
-            ]
+        member_counts_by_size = {size: 0 for size in sizes}
+        for item in inputs.existing_unit_mix_rows:
+            projected_size = project_member_target_size(item.exclusive_area_sqm, default_exclusive, sizes)
+            member_counts_by_size[projected_size] += item.households
+        member_counts = [member_counts_by_size[size] for size in sizes]
+        member_total = sum(member_counts)
+        if planned_households <= member_total:
+            counts = allocate_counts_by_weights(planned_households, [float(count) for count in member_counts])
         else:
-            mid_share = max(1.0 - small_share, 0.0)
-            weights = [max(small_share, 0.25), max(mid_share * 0.35, 0.18), max(mid_share * 0.45, 0.22)]
+            extra_counts = allocate_counts_by_weights(
+                planned_households - member_total,
+                extra_sale_weights_from_member_mix(member_counts, sizes, default_exclusive),
+            )
+            counts = [member + extra for member, extra in zip(member_counts, extra_counts)]
     else:
         if len(sizes) == 4:
             if average_exclusive >= 100:
@@ -689,8 +784,7 @@ def auto_planned_unit_mix_rows(inputs: UnionProjectInputs, planned_households: i
                 weights = [0.40, 0.20, 0.40]
             else:
                 weights = [0.26, 0.18, 0.56]
-
-    counts = allocate_counts_by_weights(planned_households, weights)
+        counts = allocate_counts_by_weights(planned_households, weights)
     rows: list[UnitMixRow] = []
     for size, households in zip(sizes, counts):
         if households <= 0:
@@ -1357,11 +1451,13 @@ def estimate_union_plan_preview(inputs: UnionProjectInputs) -> UnionPlanPreview:
     )
 
     official_target_bcr_pct = inputs.seoul_project.target_building_coverage_ratio_pct if inputs.seoul_project else None
-    target_bcr_pct = inputs.target_building_coverage_ratio_pct or official_target_bcr_pct
+    target_bcr_pct = inputs.target_building_coverage_ratio_pct or official_target_bcr_pct or inputs.current_building_coverage_ratio_pct
     if inputs.target_building_coverage_ratio_pct is not None:
         target_bcr_source = "manual"
     elif official_target_bcr_pct is not None:
         target_bcr_source = "official_cleanup"
+    elif inputs.current_building_coverage_ratio_pct is not None:
+        target_bcr_source = "heuristic"
     else:
         target_bcr_source = "heuristic"
     required_avg_floors = None
@@ -1393,6 +1489,10 @@ def estimate_union_plan_preview(inputs: UnionProjectInputs) -> UnionPlanPreview:
         default_supply_area = inputs.current_unit_supply_area
     initial_supply_rows = inputs.planned_unit_mix_rows or inputs.existing_unit_mix_rows
     average_supply_area_sqm = weighted_average_supply_area(initial_supply_rows, default_supply_area)
+    average_exclusive_area_sqm = weighted_average_exclusive_area(
+        initial_supply_rows,
+        inputs.expected_new_exclusive_area or inputs.current_unit_exclusive_area,
+    )
 
     if site_resolution.selected_total_site_area_sqm is not None:
         gross_floor_area_sqm = site_resolution.selected_total_site_area_sqm * (target_far_pct / 100.0)
@@ -1402,7 +1502,15 @@ def estimate_union_plan_preview(inputs: UnionProjectInputs) -> UnionPlanPreview:
         multiplier = 1.38 if inputs.project_kind == ProjectKind.REDEVELOPMENT else 1.32 if inputs.reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER else 1.28
         gross_floor_area_sqm = current_gross_floor_area_sqm * multiplier
 
-    residential_efficiency = 0.80 if inputs.project_kind == ProjectKind.REDEVELOPMENT else 0.82 if inputs.reconstruction_style == ReconstructionStyle.DETACHED_CLUSTER else 0.84
+    residential_efficiency, residential_efficiency_source = estimate_residential_efficiency(
+        project_kind=inputs.project_kind,
+        reconstruction_style=inputs.reconstruction_style,
+        required_avg_floors=required_avg_floors,
+        target_bcr_pct=target_bcr_pct,
+        current_far_pct=inputs.current_far_pct,
+        target_far_pct=target_far_pct,
+        average_exclusive_area_sqm=average_exclusive_area_sqm,
+    )
     saleable_area_factor = clamp(1.0 - donation_ratio, 0.55, 1.0)
     initial_simulated_total_households = max(int(round((gross_floor_area_sqm * residential_efficiency * saleable_area_factor) / max(average_supply_area_sqm, 1.0))), 1)
 
@@ -1419,11 +1527,37 @@ def estimate_union_plan_preview(inputs: UnionProjectInputs) -> UnionPlanPreview:
 
     planned_mix_rows, planned_mix_source = auto_planned_unit_mix_rows(inputs, planned_households)
     average_supply_area_sqm = weighted_average_supply_area(planned_mix_rows or inputs.existing_unit_mix_rows, default_supply_area)
+    average_exclusive_area_sqm = weighted_average_exclusive_area(
+        planned_mix_rows or inputs.existing_unit_mix_rows,
+        inputs.expected_new_exclusive_area or inputs.current_unit_exclusive_area,
+    )
+    residential_efficiency, residential_efficiency_source = estimate_residential_efficiency(
+        project_kind=inputs.project_kind,
+        reconstruction_style=inputs.reconstruction_style,
+        required_avg_floors=required_avg_floors,
+        target_bcr_pct=target_bcr_pct,
+        current_far_pct=inputs.current_far_pct,
+        target_far_pct=target_far_pct,
+        average_exclusive_area_sqm=average_exclusive_area_sqm,
+    )
     simulated_total_households = max(int(round((gross_floor_area_sqm * residential_efficiency * saleable_area_factor) / max(average_supply_area_sqm, 1.0))), 1)
     if planned_households_source == "simulation":
         planned_households = simulated_total_households
         planned_mix_rows, planned_mix_source = auto_planned_unit_mix_rows(inputs, planned_households)
         average_supply_area_sqm = weighted_average_supply_area(planned_mix_rows or inputs.existing_unit_mix_rows, default_supply_area)
+        average_exclusive_area_sqm = weighted_average_exclusive_area(
+            planned_mix_rows or inputs.existing_unit_mix_rows,
+            inputs.expected_new_exclusive_area or inputs.current_unit_exclusive_area,
+        )
+        residential_efficiency, residential_efficiency_source = estimate_residential_efficiency(
+            project_kind=inputs.project_kind,
+            reconstruction_style=inputs.reconstruction_style,
+            required_avg_floors=required_avg_floors,
+            target_bcr_pct=target_bcr_pct,
+            current_far_pct=inputs.current_far_pct,
+            target_far_pct=target_far_pct,
+            average_exclusive_area_sqm=average_exclusive_area_sqm,
+        )
         simulated_total_households = max(int(round((gross_floor_area_sqm * residential_efficiency * saleable_area_factor) / max(average_supply_area_sqm, 1.0))), 1)
         planned_households = simulated_total_households
 
@@ -1467,6 +1601,9 @@ def estimate_union_plan_preview(inputs: UnionProjectInputs) -> UnionPlanPreview:
         current_gross_floor_area_sqm=current_gross_floor_area_sqm,
         gross_floor_area_sqm=gross_floor_area_sqm,
         average_supply_area_sqm=average_supply_area_sqm,
+        average_exclusive_area_sqm=average_exclusive_area_sqm,
+        residential_efficiency=residential_efficiency,
+        residential_efficiency_source=residential_efficiency_source,
         planned_households=planned_households,
         planned_households_source=planned_households_source,
         simulated_total_households=simulated_total_households,
@@ -1603,6 +1740,9 @@ def calculate_union_project(inputs: UnionProjectInputs) -> CalculationResult:
     current_gross_floor_area_sqm = plan_preview.current_gross_floor_area_sqm
     gross_floor_area_sqm = plan_preview.gross_floor_area_sqm
     average_supply_area_sqm = plan_preview.average_supply_area_sqm
+    average_exclusive_area_sqm = plan_preview.average_exclusive_area_sqm
+    residential_efficiency = plan_preview.residential_efficiency
+    residential_efficiency_source = plan_preview.residential_efficiency_source
     site_resolution = plan_preview.site_resolution
     planned_households = plan_preview.planned_households
     planned_households_source = plan_preview.planned_households_source
@@ -1886,6 +2026,8 @@ def calculate_union_project(inputs: UnionProjectInputs) -> CalculationResult:
         warnings.append(warning("risk", "법적 상한 초과", f"목표 용적률 {target_far_pct:.1f}%와 목표 건폐율 {target_bcr_pct:.1f}% 기준 평균 {required_avg_floors:.1f}층이 필요해 계획이 과도할 수 있습니다."))
     elif required_avg_floors is not None and required_avg_floors > 25.0:
         warnings.append(warning("warn", "입력 부족", f"목표 용적률 {target_far_pct:.1f}%와 목표 건폐율 {target_bcr_pct:.1f}% 기준 평균 {required_avg_floors:.1f}층이 필요합니다. 층수 계획과 세대계획을 다시 점검해 보세요."))
+    if planned_households_source == "simulation" and residential_efficiency < 0.62:
+        warnings.append(warning("warn", "고층 효율 감산", f"초고층·저건폐율 조합으로 판단되어 주거효율을 {fmt_pct(residential_efficiency)}로 보수 적용했습니다. 세대수 자동안은 이를 반영해 낮춰 계산합니다."))
 
     confidence_score = compute_confidence_score(
         region_is_seoul=inputs.region_is_seoul,
@@ -1924,6 +2066,9 @@ def calculate_union_project(inputs: UnionProjectInputs) -> CalculationResult:
         {"항목": "대지면적", "값": f"{site_resolution.selected_total_site_area_sqm:,.1f}㎡" if site_resolution.selected_total_site_area_sqm is not None else "-", "출처": humanize_source(site_resolution.source)},
         {"항목": "목표 건폐율", "값": f"{target_bcr_pct:.1f}%" if target_bcr_pct is not None else "-", "출처": humanize_source(target_bcr_source) if target_bcr_pct is not None else "-"},
         {"항목": "준공 후 평형 계획", "값": f"{len(planned_mix_rows)}건", "출처": humanize_source(planned_mix_source)},
+        {"항목": "평균 전용면적", "값": f"{average_exclusive_area_sqm:,.1f}㎡", "출처": humanize_source(planned_mix_source)},
+        {"항목": "평균 공급면적", "값": f"{average_supply_area_sqm:,.1f}㎡", "출처": humanize_source(planned_mix_source)},
+        {"항목": "주거효율 계수", "값": fmt_pct(residential_efficiency), "출처": humanize_source(residential_efficiency_source)},
         {"항목": "일반분양가 기준", "값": fmt_money(general_sale_unit_price), "출처": humanize_source(business_price_source)},
         {"항목": "출구가치 기준", "값": fmt_money(exit_unit_price), "출처": humanize_source(exit_price_source)},
         {"항목": "종전자산 추정", "값": fmt_money(old_asset_estimate), "출처": humanize_source(old_asset_source)},
@@ -1947,6 +2092,7 @@ def calculate_union_project(inputs: UnionProjectInputs) -> CalculationResult:
         {"구분": "사업", "항목": "현황 건폐율", "값": f"{inputs.current_building_coverage_ratio_pct:.1f}%" if inputs.current_building_coverage_ratio_pct is not None else "-"},
         {"구분": "사업", "항목": "목표 건폐율", "값": f"{target_bcr_pct:.1f}%" if target_bcr_pct is not None else "-"},
         {"구분": "사업", "항목": "필요 평균층수", "값": f"{required_avg_floors:.1f}층" if required_avg_floors is not None else "점검 생략"},
+        {"구분": "사업", "항목": "주거효율 계수", "값": fmt_pct(residential_efficiency)},
         {"구분": "사업", "항목": "준공 후 평형 계획", "값": humanize_source(planned_mix_source)},
         {"구분": "금융", "항목": "PF / 이주비", "값": f"PF {fmt_pct(inputs.pf_rate)}, 이주비 {fmt_pct(inputs.move_loan_rate)}"},
         {"구분": "제도", "항목": "서울 정책 계수", "값": f"{policy.coefficient:.2f}" if policy.active else "미적용"},
@@ -2648,6 +2794,13 @@ def main() -> None:
             if uses_apartment_reconstruction_flow(project_kind, reconstruction_style)
             else []
         )
+        use_target_households_override_state = bool(st.session_state.get("use_target_households_override", False))
+        use_general_sale_ratio_override_state = bool(st.session_state.get("use_general_sale_ratio_override", False))
+        use_rental_ratio_override_state = bool(st.session_state.get("use_rental_ratio_override", False))
+        use_donation_ratio_override_state = bool(st.session_state.get("use_donation_ratio_override", False))
+        use_planned_unit_mix_override_state = bool(st.session_state.get("use_planned_unit_mix_override", False))
+        preview_planned_unit_mix_text = str(st.session_state.get("planned_unit_mix_text", ""))
+        preview_planned_unit_mix_rows = parse_unit_mix_text(preview_planned_unit_mix_text, project_kind) if use_planned_unit_mix_override_state else []
         preview_inputs = UnionProjectInputs(
             project_kind=project_kind,
             reconstruction_style=reconstruction_style,
@@ -2675,15 +2828,15 @@ def main() -> None:
             recent_same_complex_trade_price=None,
             adjustment_factor_override=None,
             existing_unit_mix_rows=preview_existing_unit_mix_rows,
-            planned_unit_mix_rows=[],
+            planned_unit_mix_rows=preview_planned_unit_mix_rows,
             official_price_reference=None,
             appraised_old_asset_value=None,
             total_old_asset_value=None,
             avg_official_land_price_per_sqm=maybe_float(st.session_state.get("avg_official_land_price_per_sqm", 0.0)),
-            target_households_override=None,
-            general_sale_ratio_override=None,
-            rental_ratio_override=None,
-            donation_ratio_override=None,
+            target_households_override=maybe_int(int(st.session_state.get("target_households_override_value", 0))) if use_target_households_override_state else None,
+            general_sale_ratio_override=maybe_float(float(st.session_state.get("general_sale_ratio_override_pct", 0.0)) / 100.0) if use_general_sale_ratio_override_state else None,
+            rental_ratio_override=maybe_float(float(st.session_state.get("rental_ratio_override_pct", 0.0)) / 100.0) if use_rental_ratio_override_state else None,
+            donation_ratio_override=maybe_float(float(st.session_state.get("donation_ratio_override_pct", 0.0)) / 100.0) if use_donation_ratio_override_state else None,
             member_sale_price_ratio_override=None,
             sale_rate=max(float(st.session_state.get("sale_rate_pct", 97.0)), 0.0) / 100.0,
             cash_settlement_rate=max(float(st.session_state.get("cash_settlement_rate_pct", default_cash_settlement_rate_pct)), 0.0) / 100.0,
@@ -2702,31 +2855,31 @@ def main() -> None:
         sync_auto_number_state(
             "target_households_override_value",
             max(plan_preview.planned_households, 1),
-            force=not st.session_state.get("use_target_households_override", False),
+            force=not use_target_households_override_state,
         )
         sync_auto_number_state(
             "general_sale_ratio_override_pct",
             round(clamp(plan_preview.general_sale_ratio * 100.0, 0.0, 100.0), 1),
-            force=not st.session_state.get("use_general_sale_ratio_override", False),
+            force=not use_general_sale_ratio_override_state,
         )
         sync_auto_number_state(
             "rental_ratio_override_pct",
             round(clamp(plan_preview.rental_ratio * 100.0, 0.0, 40.0), 1),
-            force=not st.session_state.get("use_rental_ratio_override", False),
+            force=not use_rental_ratio_override_state,
         )
         sync_auto_number_state(
             "donation_ratio_override_pct",
             round(clamp(plan_preview.donation_ratio * 100.0, 0.0, 40.0), 1),
-            force=not st.session_state.get("use_donation_ratio_override", False),
+            force=not use_donation_ratio_override_state,
         )
         auto_planned_unit_mix_text = unit_mix_rows_to_text(plan_preview.planned_mix_rows)
         sync_auto_text_state(
             "planned_unit_mix_text",
             auto_planned_unit_mix_text,
-            force=not st.session_state.get("use_planned_unit_mix_override", False),
+            force=not use_planned_unit_mix_override_state,
         )
         with st.expander("정밀 입력", expanded=False):
-            st.markdown("#### 자동 제안값")
+            st.markdown("#### 현재 반영안")
             render_table(
                 [
                     {
@@ -2736,9 +2889,10 @@ def main() -> None:
                         "기부채납": fmt_pct(plan_preview.donation_ratio),
                         "필요 평균층수": f"{plan_preview.required_avg_floors:.1f}층" if plan_preview.required_avg_floors is not None else "-",
                         "남은 기간": f"{plan_preview.remaining_months / 12.0:.1f}년",
+                        "주거효율": fmt_pct(plan_preview.residential_efficiency),
                     }
                 ],
-                "현재 입력 기준 자동안",
+                "현재 입력 기준 반영안",
             )
             d1, d2, d3, d4 = st.columns(4)
             with d1:
@@ -2848,9 +3002,9 @@ def main() -> None:
                     }
                     for row in plan_preview.planned_mix_rows
                 ],
-                "준공 후 공급 평형 자동안",
+                "준공 후 공급 평형 현재 반영안",
             )
-            st.caption("위 자동안은 현재 입력된 기존 평형 분포, 총세대수, 용적률, 임대/기부채납 자동값을 기준으로 실시간 재계산됩니다.")
+            st.caption("위 반영안은 기존 평형 분포와 현재 켜 둔 수동 보정값을 함께 반영해 실시간 재계산됩니다.")
 
             f1, f2, f3, f4 = st.columns(4)
             with f1:
