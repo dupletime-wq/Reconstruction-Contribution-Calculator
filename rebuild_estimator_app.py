@@ -1,3 +1,7 @@
+# 현재 실행 엔트리포인트는 `app.py` 입니다.
+# 이 파일은 외부조회/문서업로드가 섞여 있던 구버전 초안 참조용으로만 남겨 둡니다.
+# 최신 구현과 기능 추가는 `app.py`를 기준으로 확인해 주세요.
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
