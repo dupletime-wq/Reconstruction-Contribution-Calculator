@@ -9,6 +9,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import rebuild_estimator_engine as engine
 
 try:
     import streamlit as st
@@ -135,6 +136,15 @@ class SeoulProjectData:
     average_current_floors: float | None = None
     current_building_count: int | None = None
     schedule_text: str | None = None
+    official_planned_households: int | None = None
+    official_general_sale_households: int | None = None
+    official_rental_households: int | None = None
+    official_public_facility_area_sqm: float | None = None
+    official_donation_area_sqm: float | None = None
+    official_target_far_pct: float | None = None
+    official_target_bcr_pct: float | None = None
+    project_route_hint: str | None = None
+    source_reference_date: str = "2024-01-19"
     existing_unit_mix_rows: list[UnitMixRow] = field(default_factory=list)
     source_records: list[SourceRecord] = field(default_factory=list)
 
@@ -220,6 +230,9 @@ class UnionProjectInputs:
     manual_reconstruction_levy_total: float | None
     is_one_homeowner: bool
     holding_years: float
+    project_route: str = "auto"
+    policy_profile_version: str = "seoul-v1"
+    market_reference_mode: str = "official_plus_market"
 
 
 @dataclass
@@ -295,6 +308,127 @@ class UnionPlanPreview:
     general_sale_ratio: float
     planned_mix_rows: list[UnitMixRow]
     planned_mix_source: str
+
+
+def to_engine_project_kind(project_kind: ProjectKind) -> engine.ProjectKind:
+    return engine.ProjectKind[project_kind.name]
+
+
+def to_engine_reconstruction_style(reconstruction_style: ReconstructionStyle) -> engine.ReconstructionStyle:
+    return engine.ReconstructionStyle[reconstruction_style.name]
+
+
+def to_engine_unit_mix_rows(rows: list[UnitMixRow]) -> list[engine.UnitMixRow]:
+    return [
+        engine.UnitMixRow(
+            label=row.label,
+            households=row.households,
+            exclusive_area_sqm=row.exclusive_area_sqm,
+            supply_area_sqm=row.supply_area_sqm,
+        )
+        for row in rows
+    ]
+
+
+def to_engine_seoul_project(project: SeoulProjectData | None) -> engine.SeoulProjectData | None:
+    if project is None:
+        return None
+    project_kind = None if project.project_kind is None else to_engine_project_kind(project.project_kind)
+    return engine.SeoulProjectData(
+        project_name=project.project_name,
+        district=project.district,
+        business_type=project.business_type,
+        project_kind=project_kind,
+        progress_stage=project.progress_stage,
+        representative_lot=project.representative_lot,
+        project_slug=project.project_slug,
+        cafe_id=project.cafe_id,
+        source_url=project.source_url,
+        official_area_sqm=project.official_area_sqm,
+        site_area_sqm=project.site_area_sqm,
+        gross_floor_area_sqm=project.gross_floor_area_sqm,
+        target_building_coverage_ratio_pct=project.target_building_coverage_ratio_pct,
+        target_far_pct=project.target_far_pct,
+        current_households=project.current_households,
+        owner_count=project.owner_count,
+        tenant_count=project.tenant_count,
+        planned_households=project.planned_households,
+        sale_households_total=project.sale_households_total,
+        sale_households=project.sale_households,
+        rental_households=project.rental_households,
+        public_facility_area_sqm=project.public_facility_area_sqm,
+        donation_area_sqm=project.donation_area_sqm,
+        average_current_floors=project.average_current_floors,
+        current_building_count=project.current_building_count,
+        schedule_text=project.schedule_text,
+        official_planned_households=project.official_planned_households,
+        official_general_sale_households=project.official_general_sale_households,
+        official_rental_households=project.official_rental_households,
+        official_public_facility_area_sqm=project.official_public_facility_area_sqm,
+        official_donation_area_sqm=project.official_donation_area_sqm,
+        official_target_far_pct=project.official_target_far_pct,
+        official_target_bcr_pct=project.official_target_bcr_pct,
+        project_route_hint=project.project_route_hint,
+        source_reference_date=project.source_reference_date,
+        existing_unit_mix_rows=to_engine_unit_mix_rows(project.existing_unit_mix_rows),
+        source_records=[engine.SourceRecord(key=item.key, value=item.value, source=item.source, note=item.note) for item in project.source_records],
+    )
+
+
+def to_engine_union_inputs(inputs: UnionProjectInputs) -> engine.UnionProjectInputs:
+    return engine.UnionProjectInputs(
+        project_kind=to_engine_project_kind(inputs.project_kind),
+        reconstruction_style=to_engine_reconstruction_style(inputs.reconstruction_style),
+        region_is_seoul=inputs.region_is_seoul,
+        seoul_project=to_engine_seoul_project(inputs.seoul_project),
+        purchase_price=inputs.purchase_price,
+        current_stage=inputs.current_stage,
+        current_households=inputs.current_households,
+        current_unit_exclusive_area=inputs.current_unit_exclusive_area,
+        current_unit_supply_area=inputs.current_unit_supply_area,
+        expected_new_exclusive_area=inputs.expected_new_exclusive_area,
+        comparison_new_price=inputs.comparison_new_price,
+        general_sale_price=inputs.general_sale_price,
+        general_sale_price_basis_exclusive_area=inputs.general_sale_price_basis_exclusive_area,
+        general_sale_price_per_pyeong_manwon=inputs.general_sale_price_per_pyeong_manwon,
+        construction_cost_per_pyeong=inputs.construction_cost_per_pyeong,
+        current_far_pct=inputs.current_far_pct,
+        target_far_pct=inputs.target_far_pct,
+        total_site_area_sqm=inputs.total_site_area_sqm,
+        land_share_sqm=inputs.land_share_sqm,
+        current_building_coverage_ratio_pct=inputs.current_building_coverage_ratio_pct,
+        target_building_coverage_ratio_pct=inputs.target_building_coverage_ratio_pct,
+        average_current_floors=inputs.average_current_floors,
+        floor_no=inputs.floor_no,
+        recent_same_complex_trade_price=inputs.recent_same_complex_trade_price,
+        adjustment_factor_override=inputs.adjustment_factor_override,
+        existing_unit_mix_rows=to_engine_unit_mix_rows(inputs.existing_unit_mix_rows),
+        planned_unit_mix_rows=to_engine_unit_mix_rows(inputs.planned_unit_mix_rows),
+        official_price_reference=inputs.official_price_reference,
+        appraised_old_asset_value=inputs.appraised_old_asset_value,
+        total_old_asset_value=inputs.total_old_asset_value,
+        avg_official_land_price_per_sqm=inputs.avg_official_land_price_per_sqm,
+        target_households_override=inputs.target_households_override,
+        general_sale_ratio_override=inputs.general_sale_ratio_override,
+        rental_ratio_override=inputs.rental_ratio_override,
+        donation_ratio_override=inputs.donation_ratio_override,
+        member_sale_price_ratio_override=inputs.member_sale_price_ratio_override,
+        sale_rate=inputs.sale_rate,
+        cash_settlement_rate=inputs.cash_settlement_rate,
+        pf_rate=inputs.pf_rate,
+        move_loan_rate=inputs.move_loan_rate,
+        pf_financing_ratio=inputs.pf_financing_ratio,
+        pf_interest_months=inputs.pf_interest_months,
+        average_move_loan_amount=inputs.average_move_loan_amount,
+        move_loan_duration_months=inputs.move_loan_duration_months,
+        include_reconstruction_levy=inputs.include_reconstruction_levy,
+        manual_reconstruction_levy_total=inputs.manual_reconstruction_levy_total,
+        is_one_homeowner=inputs.is_one_homeowner,
+        holding_years=inputs.holding_years,
+        project_route=inputs.project_route,
+        policy_profile_version=inputs.policy_profile_version,
+        market_reference_mode=inputs.market_reference_mode,
+    )
 
 
 def cache_data(*args, **kwargs):
@@ -861,10 +995,25 @@ def normalize_stage_name(raw_stage: str | None) -> str | None:
 
 def guess_project_kind(text: str | None) -> ProjectKind | None:
     raw = str(text or "")
-    if "재개발" in raw:
+    if "\uc7ac\uac1c\ubc1c" in raw or "재개발" in raw:
         return ProjectKind.REDEVELOPMENT
-    if "재건축" in raw:
+    if "\uc7ac\uac74\ucd95" in raw or "재건축" in raw:
         return ProjectKind.RECONSTRUCTION
+    return None
+
+
+def guess_project_route_hint(text_parts: list[str | None], guessed_kind: ProjectKind | None) -> str | None:
+    haystack = " ".join(str(part or "") for part in text_parts)
+    if "\uacf5\uacf5\uc7ac\uac1c\ubc1c" in haystack:
+        return "seoul_public_redevelopment"
+    has_public_contribution = "\uacf5\uacf5\uae30\uc5ec" in haystack
+    has_relaxation = "\uc644\ud654" in haystack or "\uc885\uc0c1\ud5a5" in haystack
+    if has_public_contribution and has_relaxation:
+        return "seoul_contribution_relaxed"
+    if guessed_kind == ProjectKind.RECONSTRUCTION:
+        return "seoul_private_reconstruction"
+    if guessed_kind == ProjectKind.REDEVELOPMENT:
+        return "seoul_private_redevelopment"
     return None
 
 
@@ -1175,18 +1324,36 @@ def cleanup_fetch_project_summary(project_slug: str) -> SeoulProjectData | None:
     planned_sale_total = extract_households_from_supply_table(sale_table)
     planned_rental = extract_households_from_supply_table(rental_table)
     public_facility_area_sqm, donation_area_sqm = extract_public_facility_areas(land_use_table, facility_table)
-    guessed_kind = guess_project_kind(basics_map.get("사업구분", ""))
+    guessed_kind = (
+        guess_project_kind(basics_map.get("사업구분", ""))
+        or guess_project_kind(main_html)
+        or guess_project_kind(summary_html)
+    )
     existing_unit_mix_rows = choose_best_unit_mix_candidate(tables, guessed_kind or ProjectKind.RECONSTRUCTION)
 
     member_seed = current_households or owner_count
     planned_general_sale = None
     if planned_sale_total is not None and member_seed is not None:
         planned_general_sale = max(planned_sale_total - member_seed, 0)
+    project_name = basics_map.get("\uc815\ube44\uad6c\uc5ed \uba85\uce6d", project_slug) or project_slug
+    route_hint = None
+    business_type = basics_map.get("?ъ뾽援щ텇", "")
+    if "怨듦났?ш컻諛?" in business_type:
+        route_hint = "seoul_public_redevelopment"
+    elif "?뿭?몄꽑 ?쒖꽦?붿솕" in business_type:
+        route_hint = "seoul_contribution_relaxed"
+    elif guessed_kind == ProjectKind.RECONSTRUCTION:
+        route_hint = "seoul_private_reconstruction"
+    elif guessed_kind == ProjectKind.REDEVELOPMENT:
+        route_hint = "seoul_private_redevelopment"
+
+    business_type = basics_map.get("\uc0ac\uc5c5\uad6c\ubd84", "") or business_type
+    route_hint = guess_project_route_hint([business_type, project_name, main_html, summary_html], guessed_kind) or route_hint
 
     project = SeoulProjectData(
         project_name=basics_map.get("정비구역 명칭", project_slug),
         district=(basics_map.get("정비구역 위치", "").split()[0] if basics_map.get("정비구역 위치") else ""),
-        business_type=basics_map.get("사업구분", ""),
+        business_type=business_type,
         project_kind=guessed_kind,
         progress_stage=None,
         representative_lot=basics_map.get("정비구역 위치", ""),
@@ -1207,6 +1374,14 @@ def cleanup_fetch_project_summary(project_slug: str) -> SeoulProjectData | None:
         rental_households=planned_rental,
         public_facility_area_sqm=public_facility_area_sqm,
         donation_area_sqm=donation_area_sqm,
+        official_planned_households=(planned_sale_total or 0) + (planned_rental or 0) or None,
+        official_general_sale_households=planned_general_sale,
+        official_rental_households=planned_rental,
+        official_public_facility_area_sqm=public_facility_area_sqm,
+        official_donation_area_sqm=donation_area_sqm,
+        official_target_far_pct=parse_float(building_row[5]) if len(building_row) > 5 else None,
+        official_target_bcr_pct=parse_float(building_row[4]) if len(building_row) > 4 else None,
+        project_route_hint=route_hint,
         existing_unit_mix_rows=existing_unit_mix_rows,
     )
     project.schedule_text = cleanup_fetch_schedule_text(cafe_id)
@@ -1428,6 +1603,8 @@ def estimate_rental_ratio(inputs: UnionProjectInputs) -> tuple[float, str]:
 
 
 def estimate_union_plan_preview(inputs: UnionProjectInputs) -> UnionPlanPreview:
+    return engine.estimate_union_plan_preview(to_engine_union_inputs(inputs))
+
     policy = seoul_policy_adjustment(
         project_kind=inputs.project_kind,
         region_is_seoul=inputs.region_is_seoul,
@@ -1718,6 +1895,8 @@ def add_standard_union_warnings(
 
 
 def calculate_union_project(inputs: UnionProjectInputs) -> CalculationResult:
+    return engine.calculate_union_project(to_engine_union_inputs(inputs))
+
     warnings: list[WarningMessage] = []
     policy = seoul_policy_adjustment(
         project_kind=inputs.project_kind,
@@ -2189,6 +2368,7 @@ def calculate_union_project(inputs: UnionProjectInputs) -> CalculationResult:
 
 def calculate_remodeling(inputs: RemodelingInputs) -> CalculationResult:
     warnings: list[WarningMessage] = []
+    warnings.append(warning("warn", "정밀화 미적용", "이번 v1 정밀화는 서울 재개발·재건축만 대상으로 하고 리모델링 로직은 기존 계산식을 유지합니다."))
     current_year = datetime.now().year
     elapsed_years = max(current_year - inputs.completion_year, 0)
     max_additional_households = int(inputs.current_households * 0.15)
